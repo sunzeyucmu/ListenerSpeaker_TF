@@ -338,7 +338,7 @@ for d, b1, b2 in zip(speech_dev[:32], batched_ds.take(1), result.take(1)): #Firs
 
 """### Model Structure
 
-### Encoder
+### Utilities, Sanity Check
 """
 
 # Helper, Debug func
@@ -359,6 +359,10 @@ def inspect_wieghts(model):
       cur_num_vars = cur_num_vars * w.shape[i]
     num_vars  = num_vars + cur_num_vars
   print("Total Trainable variables: ", num_vars)
+
+
+
+"""### Encoder"""
 
 # One Example batch (B=32)
 example_batch = next(iter(result))
@@ -407,25 +411,38 @@ class pBLSTM(tf.keras.Model):
     # outputs of the forward and backward RNNs will be combined using default: concatenate
     self.blstm = L.Bidirectional(self.lstm) # 2*hidden_dim
 
+  # @tf.function
   def call(self, x_padded):
     '''
     param x_padded: padded input, (B, T_max, F)
     param x_lens: actual senquence length (B, ) TODO
     '''
 
+    # Debug
+    # print("Input Batch Shape: ", x_padded.shape)
+    # print("Runtime sequence shape: ", tf.shape(x_padded)[1])
+    '''
+      Tensor.shape: The returned tf.TensorShape is determined at build time, without executing the underlying kernel. It is not a tf.Tensor. 
+      If you need a shape tensor, either convert the tf.TensorShape to a tf.constant, 
+      or use the tf.shape(tensor) function, which returns the tensor's shape at execution time.
+    '''
     # chop off extra odd timestamp
-    x_padded = x_padded[:, :(x_padded.shape[1] // 2) * 2, :] # (B, T_max*, F)
-    print("Chop off :", x_padded.shape)
+    # x_padded = x_padded[:, :(x_padded.shape[1] // 2) * 2, :] # (B, T_max*, F)
+    x_padded = x_padded[:, :(tf.shape(x_padded)[1] // 2) * 2, :] # (B, T_max*, F)
+    # print("Chop off :", x_padded.shape)
 
     # reshape to (B, T_max*/2, 2*F)
     ## Output shape of 'Reshape': (batch_size,) + target_shape
     x_paird = L.Reshape(target_shape=(x_padded.shape[1] // 2, x_padded.shape[2] * 2))(x_padded)
+    # x_paird = L.Reshape(target_shape=(tf.shape(x_padded)[1] // 2, tf.shape(x_padded)[2] * 2))(x_padded)
+    ### Temporrary solution using shape inference
+    x_paird = L.Reshape(target_shape=(-1, x_padded.shape[2] * 2))(x_padded)
 
-    print("REshaped", x_paird.shape)
+    # print("REshaped: ", x_paird.shape)
 
     # Output of Nets, [Forward Net States pair], [Backward Net States pair]
     ### Notice hb, cb corresponding to T=0 in Forward Net $$$
-    output, hf, cf, hb, cb = self.blstm(x_paird) # B, T_max*/2, 2*H
+    output, hf, cf, hb, cb = self.blstm(x_paird) # (B, T_max*/2, 2*H)
     
     # return the final output ( forward and backward RNNs) for now
     return output, hf, cf, hb, cb
@@ -489,10 +506,15 @@ class Attention(L.Layer):
                   key && value projections for now (TODO), h
     : TODO, currently dec_hidden == enc_size for simple scalar dot
     '''
-    
+    # print("Query Size: ", query.shape)
+    # print("Value size: ", value.shape)
     # compute the energy
     # (B, T_max), scalar enery ei,u for each input timestep u, under current decoder step i
-    energy = tf.squeeze(tf.matmul(value, tf.expand_dims(query, axis=2)))
+    ## pass in 'axis=' to tf.squeeze, remove only the current transcript ts dimension, which is 1. 
+    ## - this is to prevent squeezing batch dimension when B==1
+    energy = tf.squeeze(tf.matmul(value, tf.expand_dims(query, axis=2)), axis=2)
+
+    # print("Energy (B, T_max): ", energy.shape)
 
     # TODO: masking the padded ts
     # Attention vector, softmax, default axis=-1
@@ -516,6 +538,20 @@ att_out, att = attention(ex_query, ex_value)
 print(att_out.shape)
 print(att.shape)
 print(tf.reduce_sum(att, axis=1))
+
+# Dev
+a = tf.constant([1, 2, 3, 4, 5, 6], shape=[1, 2, 3])
+# print(a)
+b = tf.constant([7, 8, 9, 10, 11, 12], shape=[1, 3, 2])
+
+tf.matmul(a, b)
+
+print("raw query: ", ex_query.shape)
+e_query = tf.expand_dims(ex_query, axis=2)
+
+print(e_query)
+
+tf.matmul(ex_value, e_query)
 
 """### Decoder"""
 
@@ -561,22 +597,26 @@ class Decoder(tf.keras.Model):
     self.fc = L.Dense(vocab_size)
 
 
-
+  # @tf.function
   def call(self, x, value=None, hidden=None):
     '''
     :param x: (B, L_max) [ground-trouth, D] input transcrip sequence
     :param value: (B, T_max, enc_size); high-level feature representation of encoder projection, h
     :TODO, separately projected key of encoder
-    :param hidden: s-1
+    :param hidden: s-1, tuple of (hidden_state, cell_state)
     '''
+
+    # print("Input Transcripts Shape: ", x.shape)
     batch_size = x.shape[0]
-    L = x.shape[1] # max transcript length for current batch
+    L = x.shape[1] # max transcript length for current 
+    
+    
     hidden_states = hidden
 
     # (B, L_max, E) 
     # the '<sos>' embedding is not included
     x = self.embedding(x)
-    print(x.shape)
+    # print("Embedded input Shape: ", x.shape)
 
     logits = []
 
@@ -587,10 +627,12 @@ class Decoder(tf.keras.Model):
       #   char_embed = tf.zeros([batch_size], tf.float32)
       # else:
       #   char_embed = x[:, i-1, :] 
-      # print("TS: {}, embedding: {}".format(i, char_embed.shape))
-
+      
       # <sos> included, <eos> not included
+      # (B, E), for current ts
       char_embed = x[:, i, :]
+
+      # print("TS: {}, embedding: {}".format(i, char_embed.shape))
 
       ## 2. pass through rnn cell
       ### out/query (B, dec_hidden)
@@ -599,11 +641,15 @@ class Decoder(tf.keras.Model):
 
       # print("LSTM out", out.shape)
       # print(out.numpy())
+      # print(type(states))
+      # print(len(states))
       # print(states[0].numpy())
       # print(states[1].numpy())
 
       ## 3. get context vector using query and key
       ### context: (B, value_size/enc_size/dec_size)
+      # print("Compute attention for ts: {}".format(i))
+      # print("Enc value projection: ", value.shape)
       context, attention = self.attention(out, value)
 
       # print(context.shape)
@@ -626,10 +672,13 @@ class Decoder(tf.keras.Model):
       
     # (B, L_max, vocab_size)
     output = tf.concat(logits, axis=1)
-    print(output.shape)
+    # print(output.shape)
     # output, h, c = self.lstm_layer(x, initial_state = hidden)
     # dis = self.fc(output)
     # return dis, h, c
+
+    # return lstm next hidden state && cell state for each element in the batch: (B, dec_H)
+    return output, hidden_states
 
 # take in variable length input
 decoder_ = Decoder(len(LETTER_LIST), 100, 128)
@@ -637,70 +686,96 @@ decoder_ = Decoder(len(LETTER_LIST), 100, 128)
 # inspect_wieghts(decoder_)
 
 
-example_dec_output, ex_dec_h, ex_dec_c = decoder_(example_batch[1], value=tf.ones([32, 201, 128]),hidden=[tf.zeros([32, 128]), tf.zeros([32, 128])])
+# example_dec_output, ex_dec_h, ex_dec_c = decoder_(example_batch[1], value=tf.ones([32, 201, 128]),hidden=[tf.zeros([32, 128]), tf.zeros([32, 128])])
+# input tuple of (hidden_state, cell_state)
+example_dec_output, example_dec_next_states = decoder_(example_batch[1], value=tf.ones([32, 201, 128]),hidden=[tf.zeros([32, 128]), tf.zeros([32, 128])])
 # decoder_.summary()
 # inspect_wieghts(decoder_)
+print(example_dec_output.shape)
+print(example_dec_next_states[0].shape)
+print(example_dec_next_states[1].shape)
 
 print(example_dec_output.shape) # （B, T_max, V)
 print ('Decoder h vecotr shape: (batch size, dec_units) {}'.format(ex_dec_h.shape))
 print ('Decoder c vector shape: (batch size, dec_units) {}'.format(ex_dec_c.shape))
 
+"""#### E2E test"""
+
+print("Input Utterence: ", example_batch[0].shape)
+print("Target Transcripts: ", example_batch[1].shape)
+encoder = pBLSTM(hidden_dim=64)
+
+example_enc_output = encoder(example_batch[0])
+
+print(example_enc_output[0].shape)
+print(example_enc_output[1].shape)
+print(example_enc_output[2].shape)
+
+dec_ini_h = tf.concat([example_enc_output[1], example_enc_output[3]], axis=1)
+dec_ini_c = tf.concat([example_enc_output[2], example_enc_output[4]], axis=1)
+print(dec_ini_h.shape)
+print(dec_ini_c.shape)
+# print(example_enc_output[0].numpy()[:, -1, :].shape)
+# print(example_enc_output[1].numpy())
+
+decoder = Decoder(len(LETTER_LIST), 100, 128)
+
+# input 1: target transcript (B, L)
+# input 2: encoder value proj (B, T, E_H), encoder feature representation
+# input 3: initial hidden states for encoder LSTM(s)
+ex_dec_output, ex_dec_next_states = decoder(example_batch[1], value=example_enc_output[0],hidden=[dec_ini_h, dec_ini_c])
+
+print(ex_dec_output.shape)
+print(ex_dec_output.numpy()[0])
+print(ex_dec_next_states[0].shape)
+print(ex_dec_next_states[1].shape)
+
+encoder.summary()
+decoder.summary()
+inspect_wieghts(decoder)
+
+l_t = [1, 2, 3]
+l_t[:-1]
+
 """## Train"""
 
-# DEV
-y_true = [[0, 1, 0], [0, 0, 1]]
-y_pred = [[0.05, 0.95, 0], [0.1, 0.8, 0.1]]
-# Using 'auto'/'sum_over_batch_size' reduction type.
-cce = tf.keras.losses.CategoricalCrossentropy()
-cce(y_true, y_pred).numpy()
+def plot_grad_flow(grads_and_vars):
+  '''
+  input (gradients, trainable_variables)
+  '''
+  grads = grads_and_vars[0]
+  vars = grads_and_vars[1]
 
-# Reduction by sum
-cce = tf.keras.losses.CategoricalCrossentropy(
-    reduction=tf.keras.losses.Reduction.SUM)
-cce(y_true, y_pred).numpy()
+  ave_grads = []    
+  max_grads= []    
+  layers = [] 
 
-# tf.repeat(tf.range(0, 10))
-# * element-wise
-a = tf.fill([3, 3], 2)
-b = tf.fill([2, 3], 9)
+  print("# variables {}, # grads {}".format(len(vars), len(grads)))
 
-c = tf.range(0, 10)
-c = tf.expand_dims(c, axis=0)
-print(c)
+  for grad, var in zip(grads, vars):
+    name = var.name
+    layers.append(name)
 
-c = tf.repeat(c, repeats=5, axis=0)
-print(c)
+    # reduce over all dims/elements                
+    ave_grads.append(tf.reduce_mean(tf.abs(grad)))     
+    max_grads.append(tf.reduce_max(tf.abs(grad)))
 
-d = tf.constant([3,4,1,5,6,1,2])
-print(d)
-
-d = tf.repeat(tf.expand_dims(d, axis=1), repeats=5, axis=1)
-print(d)
-
-## DEV
-np.set_printoptions(threshold=20) # np.inf
-
-max_len = example_batch[1].shape[1]
-b_size = example_batch[1].shape[0]
-print(max_len)
-lens = example_batch[3]
-print(lens)
-
-# B x L_Max
-lens_m = tf.repeat(tf.expand_dims(tf.range(0, max_len), axis=0), repeats=b_size, axis=0)
-print(lens_m)
-
-# B x L_Max
-lens_e = tf.repeat(tf.expand_dims(lens, axis=1), repeats=max_len, axis=1)
-print(lens_e)
-
-mask = lens_m < lens_e
-print(mask)
-
-mask = tf.cast(mask, tf.float32)
-print(mask)
-
-print(tf.reduce_sum(mask[5]).numpy(), lens[5])
+  plt.clf()
+  plt.bar(np.arange(len(max_grads)), max_grads, alpha=0.1, lw=1, color="r")    
+  plt.bar(np.arange(len(max_grads)), ave_grads, alpha=0.1, lw=1, color="b")    
+  plt.hlines(0, 0, len(ave_grads)+1, lw=2, color="k" )    
+  plt.xticks(range(0,len(ave_grads), 1), layers, rotation="vertical")    
+  plt.xlim(left=0, right=len(ave_grads))    
+  # plt.ylim(bottom = -0.001, top=0.02) # zoom in on the lower gradient regions    
+  plt.xlabel("Layers")
+  plt.ylabel("average gradient")    
+  plt.title("Gradient flow")    
+  #plt.tight_layout()    
+  plt.grid(True)    
+  # plt.legend([Line2D([0], [0], color="c", lw=4),
+  #             Line2D([0], [0], color="b", lw=4),
+  #             Line2D([0], [0], color="k", lw=4)], ['max-gradient', 'mean-gradient', 'zero-gradient'])    
+  return plt
 
 def loss_function(real, pred, target_mask):
   # loss always reduce -1 dimension
@@ -744,7 +819,8 @@ def loss_function(real, pred, target_mask):
 
 optimizer = tf.keras.optimizers.Adam()
 
-@tf.function( experimental_relax_shapes=True)
+### TODO: under tf.function, get runtime sequence shape (errors under 'None' runtime value, both L_max and T_max)
+# @tf.function( experimental_relax_shapes=True)
 def train_step(input, target, target_mask):
   # print("=========== Inspecting weights of encoder")
 
@@ -760,12 +836,14 @@ def train_step(input, target, target_mask):
   # print(target.shape)
   # print(target.numpy())
 
-  # attach previous removed '<sos>'
-  # Ignore '<eos>'
-  # dec_input = tf.pad(target[:, :-1], [[0, 0], [1, 0]], "CONSTANT", constant_values=letter2index['<sos>'])
-  # print(dec_input)
+
   with tf.GradientTape() as tape:
-    enc_output, enc_h, enc_c =  encoder(input)
+    # enc_output, enc_h, enc_c =  encoder(input)
+
+    enc_output = encoder(input)
+
+    dec_ini_h = tf.concat([enc_output[1], enc_output[3]], axis=1)
+    dec_ini_c = tf.concat([enc_output[2], enc_output[4]], axis=1)
 
     # attach previous removed '<sos>' #TODO, remove this
     # Ignore '<eos>'
@@ -774,21 +852,27 @@ def train_step(input, target, target_mask):
     # real = target[ : , 1: ]         # ignore <start> token
     # target already have '<sos>' removed
 
-    ## $$ use decoder final state as initial state for decoder LSTM cell here
+    ## $$ use decoder final state as initial states for decoder LSTM cell here
     ## s and h sharing same size, so s-1 = hN
+    ## Use encoder direct LSTM output features as 'value' , enc_H == dec_H for sclar dot during attention computation
     ### Connecting Encoder and Decoder here to avoid `WARNING:tensorflow:Gradients do not exist for Encoder Variables when minimizing the loss.`
 
-    pred, dec_h, dec_c = decoder_(dec_input, [enc_h, enc_c]) # input targets
+    # pred, dec_h, dec_c = decoder(dec_input, [enc_h, enc_c]) # input targets
+    pred, dec_next_states = decoder(dec_input, value=enc_output[0], hidden=[dec_ini_h, dec_ini_c])
     
     loss, unmasked_loss = loss_function(target, pred, target_mask)
 
-  variables = encoder.trainable_variables + decoder_.trainable_variables
+  variables = encoder.trainable_variables + decoder.trainable_variables
 
+  # print("BackWarding: Back Prop loss.......")
   # # Calculate the gradients for encoder and decoder
+  # print("Type of loss: {}, value of loss: {}".format(type(loss), loss.numpy()))
+
+  ## returned gradieents are a list or nested structure of Tensors, one for each element in sources. same structure as sources.
   gradients = tape.gradient(loss, variables)
   optimizer.apply_gradients(zip(gradients, variables))
 
-  return loss, unmasked_loss
+  return loss, unmasked_loss, (gradients, variables)
 
 EPOCHS = 10
 data = result_train # dev dataset: result
@@ -802,6 +886,8 @@ for epoch in range(EPOCHS):
     # print('Batch # {}'.format(batch))
     # Debug
     # print(type(inp), type(targ), type(input_lens), type(target_lens))
+    # print(inp.shape)
+    # print(targ.shape)
     # print(target_lens)
     # Generate mask before hand
     # Mask based on target lens
@@ -824,7 +910,8 @@ for epoch in range(EPOCHS):
     # print('Mask sum at transcript i: {}, actual transcript length: {}'.format(tf.reduce_sum(mask[5]), target_lens[5]))
 
     # Train Current Step
-    batch_loss, batch_unmasked_loss = train_step(inp, targ, mask)
+    # print("----Batch {}: train_step".format(batch))
+    batch_loss, batch_unmasked_loss, grads_vars = train_step(inp, targ, mask)
     total_loss += batch_loss
 
     if batch % 10 == 0:
@@ -832,6 +919,11 @@ for epoch in range(EPOCHS):
                                                    batch,
                                                    batch_loss, batch_unmasked_loss))
                                                   #  batch_loss.numpy())) # tf function
+      # [Sanity Check x] Plot Gradient Flow
+      if batch % 50 == 0:
+        plt = plot_grad_flow(grads_vars)
+
+        plt.show()
 
     steps_per_epoch += 1
   # # saving (checkpoint) the model every 2 epochs
@@ -853,7 +945,7 @@ monitor_gpu()
 
 # debug
 
-inspect_wieghts(decoder_)
+inspect_wieghts(decoder)
 
 inspect_wieghts(encoder)
 
@@ -877,8 +969,8 @@ r_.numpy()
 
 """## Inference/Test"""
 
-print(example_dec_output.shape) # （B, T_max, V)
-print(example_dec_output)
+print(example_dec_output.shape) # （B, T_max, vocab_size)
+# print(example_dec_output)
 
 test_batch = next(iter(result))
 print(test_batch[0].shape)
@@ -899,18 +991,27 @@ def val(num_samples=2, max_seq=20):
   og_trans = transform_index_to_letter(target_trans.numpy(), [letter2index['<eos>'], letter2index['<pad>']])
   for i in range(target_trans[:min(num_samples, batch_size)].shape[0]):
     utter = utter_input[i:i+1, :, :] # avoid squeezing
-    print("Raw Utterance: \n",utter.numpy())
+    print("===================================Raw Utterance {}: ===================================\n {}".format(i, utter.numpy()))
     target = target_trans[i:i+1, :]
     print(utter.shape) # (1, U, F)
     print(target.shape) # (1, T)
     
     # Invoke Encoder
-    enc_output, enc_h, enc_c =  encoder(utter)
-    print(enc_output.shape) # 1, U, enc_dim
+    # enc_output, enc_h, enc_c =  encoder(utter)
+
+    enc_output = encoder(utter)
+
+    enc_h = tf.concat([enc_output[1], enc_output[3]], axis=1)
+    enc_c = tf.concat([enc_output[2], enc_output[4]], axis=1)
+
+    print(type(enc_output))
+    print(enc_output[0].shape) # 1, U, enc_dim
     print(enc_h.shape) # 1, enc_dim
-    print("Last T of enc out \n", enc_output.numpy()[:, -1, :])
-    print("Enc Last Hidden state \n", enc_h.numpy())
-    print("Enc Last Cell state \n", enc_c.numpy())
+    print("Last T of enc out \n", enc_output[0].numpy()[:, -1, :])
+    print("Enc Last Hidden state \n", enc_h.shape, enc_h.numpy())
+    print("Enc Last Cell state \n", enc_c.shape, enc_c.numpy())
+
+
     # attach previous removed '<sos>'
     # Ignore '<eos>', $$$ TODO: need to remove padding
     # dec_input = tf.pad(target[:, :-1], [[0, 0], [1, 0]], "CONSTANT", constant_values=letter2index['<sos>'])
@@ -926,9 +1027,12 @@ def val(num_samples=2, max_seq=20):
     while tf.squeeze(dec_input).numpy() != letter2index['<eos>'] and len(seq) < max_seq:
       # print(h_state.numpy())
       # print(c_state.numpy())
-      pred, dec_h, dec_c = decoder_(dec_input, [h_state, c_state]) # input targets 
-      h_state = dec_h
-      c_state = dec_c
+      # pred, dec_h, dec_c = decoder_(dec_input, [h_state, c_state]) # input targets 
+      ## TODO
+      pred, next_states = decoder(dec_input, value=enc_output[0], hidden=[h_state, c_state])
+
+      h_state = next_states[0]
+      c_state = next_states[1]
       # print("Last Linear Layer :", pred.shape) # (1, 1, 35)
       # print("Hidden state of last timestamp/current :", dec_h.shape) # 1, dec_dim
       # print("Hidden Cell state of last timestamp/current: ", dec_c.shape) # 1, dec_dim
@@ -954,3 +1058,4 @@ def val(num_samples=2, max_seq=20):
     print("Predicted Transcript: ", transform_index_to_letter([seq_index], [letter2index['<eos>'], letter2index['<pad>']]))
 
 val(num_samples=10)
+
