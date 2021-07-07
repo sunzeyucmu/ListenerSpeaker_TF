@@ -364,7 +364,7 @@ def inspect_wieghts(model):
 
 """### Encoder"""
 
-# One Example batch (B=32)
+# One Example batch (B=32), from dev dataset
 example_batch = next(iter(result))
 print(example_batch[0].shape)
 print(example_batch[1].shape) # (B, max taraget length)
@@ -468,6 +468,23 @@ print(example_pblstm_output[0].shape)
 blstm.summary()
 inspect_wieghts(blstm)
 
+# example_output, example_h, example_c = encoder(example_batch[0])
+print(type(example_pblstm_output))
+print ('Encoder output shape: (batch size, sequence length, units/enc_hidden) {}'.format(example_pblstm_output[0].shape))
+print ('Forward bLSTM h vecotr shape: (batch size, units) {}'.format(example_pblstm_output[1].shape))
+print ('Forward bLSTM c vector shape: (batch size, units) {}'.format(example_pblstm_output[2].shape))
+print ('Backward bLSTM h vecotr shape: (batch size, units) {}'.format(example_pblstm_output[3].shape))
+print ('Backward bLSTM c vector shape: (batch size, units) {}'.format(example_pblstm_output[4].shape))
+
+print('Last Feature output of LSTM')
+print(example_pblstm_output[0][:, -1, :])
+
+print('Forward hidden state of last timestep')
+print(example_pblstm_output[1])
+
+print('Backward hidden state of \'last\' timestep')
+print(example_pblstm_output[3])
+
 """### Attention"""
 
 ## Dev
@@ -553,24 +570,14 @@ print(e_query)
 
 tf.matmul(ex_value, e_query)
 
-"""### Decoder"""
-
-example_output, example_h, example_c = encoder(example_batch[0])
-print(type(example_output))
-print ('Encoder output shape: (batch size, sequence length, units/enc_hidden) {}'.format(example_output.shape))
-print ('Encoder h vecotr shape: (batch size, units) {}'.format(example_h.shape))
-print ('Encoder c vector shape: (batch size, units) {}'.format(example_c.shape))
-
-print('hidden state of last timestep')
-print(example_h.numpy())
-print('Last Feature output of LSTM')
-print(example_output.numpy()[:, -1, :])
-
 example_ts_target = example_batch[1][:, 0]
 print(example_batch[1].numpy())
 print(example_ts_target.numpy())
 
-"""#### Module Decoder"""
+"""### Decoder
+
+#### Module Decoder
+"""
 
 ## Debug
 example_batch[1].shape
@@ -696,8 +703,8 @@ print(example_dec_next_states[0].shape)
 print(example_dec_next_states[1].shape)
 
 print(example_dec_output.shape) # （B, T_max, V)
-print ('Decoder h vecotr shape: (batch size, dec_units) {}'.format(ex_dec_h.shape))
-print ('Decoder c vector shape: (batch size, dec_units) {}'.format(ex_dec_c.shape))
+print ('Decoder h vecotr shape: (batch size, dec_units) {}'.format(example_dec_next_states[0].shape))
+print ('Decoder c vector shape: (batch size, dec_units) {}'.format(example_dec_next_states[1].shape))
 
 """#### E2E test"""
 
@@ -729,6 +736,8 @@ print(ex_dec_output.shape)
 print(ex_dec_output.numpy()[0])
 print(ex_dec_next_states[0].shape)
 print(ex_dec_next_states[1].shape)
+
+print(type(ex_dec_next_states))
 
 encoder.summary()
 decoder.summary()
@@ -1057,5 +1066,191 @@ def val(num_samples=2, max_seq=20):
     print("Raw Prediction sequence :", seq)
     print("Predicted Transcript: ", transform_index_to_letter([seq_index], [letter2index['<eos>'], letter2index['<pad>']]))
 
-val(num_samples=10)
+val(num_samples=1)
+
+
+
+"""##### Beam Search"""
+
+## DEV
+d = {1:-0.3246, 2:-0.9185, 3:-3985, 5:-3985, 7:5}
+
+dv = list(d.values())
+
+print(type(dv), dv)
+
+ds = sorted(d.items(), key=lambda x: x[1], reverse=True)
+
+print(ds)
+print(ds[])
+
+def prune(paths_seq, paths_idx, paths_score, paths_states, beam_width=10):
+  pruned_paths_seq = set()
+  pruned_paths_idx = {}
+  pruned_paths_score = {}
+  pruned_paths_states = {}
+
+  print("The paths scores: ", paths_score)
+
+  score_list = list(paths_score.values())
+
+  score_list.sort(reverse=True)
+
+  print("sorted scores: ", score_list)
+  cutoff = score_list[beam_width] if (beam_width < len(score_list)) else score_list[-1]
+
+  for p in paths_seq:
+    if paths_score[p] > cutoff:
+      print("Path {}, with path_score: {} get selected.".format(p, paths_score[p]))
+      pruned_paths_seq.add(p)
+      pruned_paths_idx[p] = paths_idx[p]
+      pruned_paths_score[p] = paths_score[p]
+      pruned_paths_states[p] = paths_states[p]
+
+  return pruned_paths_seq, pruned_paths_idx, pruned_paths_score, pruned_paths_states
+
+def val_beam(num_samples=2, max_seq=20):
+  # For single Batch
+  utter_input = test_batch[0] # B, U_max, F
+  target_trans = test_batch[1] # B, T_max
+  batch_size = target_trans.shape[0]
+  print(utter_input.shape)
+  print(target_trans.shape)
+
+  og_trans = transform_index_to_letter(target_trans.numpy(), [letter2index['<eos>'], letter2index['<pad>']])
+
+  # For each Utterance (encoder input)
+  for i in range(target_trans[:min(num_samples, batch_size)].shape[0]):
+    utter = utter_input[i:i+1, :, :] # avoid squeezing
+    print("===================================Raw Utterance {}: ===================================\n {}".format(i, utter.numpy()))
+    target = target_trans[i:i+1, :]
+    print(utter.shape) # (1, U, F)
+    print(target.shape) # (1, T)
+    
+    # Invoke Encoder
+    # enc_output, enc_h, enc_c =  encoder(utter)
+
+    enc_output = encoder(utter)
+
+    enc_h = tf.concat([enc_output[1], enc_output[3]], axis=1)
+    enc_c = tf.concat([enc_output[2], enc_output[4]], axis=1)
+
+    # Encoder output for current utterance, Hidden/High level representation H
+    print(type(enc_output))
+    print(enc_output[0].shape) # 1, U, enc_dim
+    print(enc_h.shape) # 1, enc_dim
+    # print("Last T of enc out \n", enc_output[0].numpy()[:, -1, :])
+    # print("Enc Last Hidden state \n", enc_h.shape, enc_h.numpy())
+    # print("Enc Last Cell state \n", enc_c.shape, enc_c.numpy())
+
+
+    # Preparation
+    path = '<sos>'
+    beam_seq = set()
+    beam_idx = {}
+    pathscore = {}
+    states = {}
+
+    beam_seq.add(path)
+    beam_idx[path] = [letter2index[path]]
+    pathscore[path] = 1.0
+    states[path] = [enc_h, enc_c]
+
+    print('Initial Beam sequence: ', beam_seq)
+    print('Initial Beam Idxs: ', beam_idx)
+
+
+    dec_input = tf.fill([1, 1], letter2index['<sos>']) # start of sequence # (1, 1)
+    seq = ['<sos>']
+    seq_index = [letter2index['<sos>']]
+    # initial Decoder State
+    # Use Encoder hidden states for now, s-1=hN
+    h_state = enc_h
+    c_state = enc_c
+
+    # while tf.squeeze(dec_input).numpy() != letter2index['<eos>'] and len(seq) < max_seq:
+    for step in range(max_seq):
+      # print(h_state.numpy())
+      # print(c_state.numpy())
+      # pred, dec_h, dec_c = decoder_(dec_input, [h_state, c_state]) # input targets 
+      ## TODO
+
+      n_beam_seq = set()
+      n_beam_idx = {}
+      n_pathscore = {}
+      n_states = {}
+
+      # 1. expore each path in beam
+      for path in beam_seq:
+        print('step {}, path: {}'.format(step, path))
+        path_idx = beam_idx[path]
+        print('sequence idx format: ', path_idx)
+
+        cfin = tf.fill([1, 1], path_idx[-1])
+        print('dec input: ', cfin)
+        hpath = states[path]
+
+        pred, next_states = decoder(cfin, value=enc_output[0], hidden=hpath)
+
+        # print("Last Linear Layer :", pred.shape) # (1, 1, 35)
+        # print('Pred :', pred.numpy())
+        # print('squeeze pred: ', tf.squeeze(pred).numpy())
+
+        for c in LETTER_LIST:
+          # TODO: is there necessary to extend more symbols than beam_width?
+          # extend the path
+          new_path = path + c
+          new_path_idx = path_idx + [letter2index[c]]
+          # print('new path seq: ', new_path)
+          # print('new path: ', new_path_idx)
+
+          
+          n_beam_idx[new_path] = new_path_idx
+          n_pathscore[new_path] = pathscore[path] * tf.squeeze(pred).numpy()[letter2index[c]] # y[c]
+          n_states[new_path] = next_states
+
+          n_beam_seq.add(new_path)
+
+
+      ## Beam Search
+      ### TODO: pruning - done
+      ### TODO: early termination, when one beam path ends in '<eos>'
+      ### TODO: track the best path so far
+
+      # beam_seq = n_beam_seq
+      # beam_idx = n_beam_idx
+      # pathscore = n_pathscore
+      # states = n_states
+
+      print("Pruning all candidate paths for step{}".format(step))
+
+      beam_seq, beam_idx, pathscore, states = prune(n_beam_seq, n_beam_idx, n_pathscore, n_states)
+
+     
+
+    
+    # list
+    top_paths = sorted(pathscore.items(), key=lambda x: x[1], reverse=True)
+
+    # print(utter.numpy())
+    print("Input Target: ", target.numpy())
+    print("Actual Transcript: ", og_trans[i])
+
+    # list(word_freq.items())[0][1]
+    print("Top Paths with Score: ", top_paths)
+
+    for res in top_paths[:3]:
+      print("Raw Prediction sequence {}, score: {}".format(res[0], res[1]))
+      print("Raw Prediction idex: ", beam_idx[res[0]])
+      # transform_index_to_letter accept multiple sentences
+      print("Predicted Transcript: ", transform_index_to_letter([beam_idx[res[0]]], [letter2index['<eos>'], letter2index['<pad>']]))
+
+    return beam_seq, beam_idx, pathscore
+
+beam_seq, beam_idx, ps = val_beam(num_samples=1, max_seq=20)
+
+## Debug/Sanity
+print(len(beam_seq), beam_seq)
+
+print(len(ps), ps)
 
