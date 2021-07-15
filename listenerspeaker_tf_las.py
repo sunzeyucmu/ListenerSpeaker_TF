@@ -36,6 +36,9 @@ gpu_available = tf.test.is_gpu_available()
 is_cuda_gpu_available = tf.test.is_gpu_available(cuda_only=True)
 is_cuda_gpu_min_3 = tf.test.is_gpu_available(True, (3,0))
 
+# Uncomment to see where your variables get placed (see below)
+tf.debugging.set_log_device_placement(False)
+
 ## Collab Pro
 def monitor_gpu():
   gpu_info = !nvidia-smi
@@ -395,6 +398,10 @@ for b in result.take(1): #First batch
   print("# Paddings in First Trans target: ", tf.reduce_sum(tf.cast(b[1][0] > 0, tf.int32)))
   print(np.sum(b[1][0] > 0))
 
+print("Type of Trainning set: {}".format(type(result_train)))
+print(type(batched_ds_train))
+print(type(ds_train))
+
 """### Model Structure
 
 ### Utilities, Sanity Check
@@ -431,29 +438,14 @@ print()
 
 """#### Pyramidal BiLSTM"""
 
-'''
-def encoder_fn(lstm_dim, input_dim=40):
-    OUTPUT_CHANNELS = 3
-    # B x L(max_len of current batch)x C
-    inputs = L.Input(shape=(None, input_dim), name='input utterances')
-
-    ### 
-    # return the final state
-    x, final_memory_state, final_carry_state = L.LSTM(lstm_dim, return_sequences=True, return_state=True, name='enc_dummy_lstm')(inputs) # B x L x H
-
-    print("output Shape ", x.shape)
-    print("Memory State Shape ", final_memory_state.shape)
-    print("Carry State Shape ", final_carry_state.shape)
-    ### Bi-LSTM
-    # lstm_layer = L.LSTM(lstm_dim, return_sequences=True, return_state=False) # return the final state (tuple)
-    # x = L.Bidirectional(lstm_layer)(inputs) # B x L x 2*H
-
-    
-
-    model = Model(inputs, [x, final_memory_state, final_carry_state])
-    
-    return model #, (final_memory_state, final_carry_state)
-'''
+## tf.function performance
+pblstm_signature = [
+    ## This based on current encoder structure: 
+    ### TODO: manage the magic number: '512
+    tf.TensorSpec(shape=(None, None, 512), dtype=tf.float32), # tf.float32, tf.int32 used while generating Dataset
+    # Can't use the raw utterance input F=40, given we will need to stack multiple pblstm
+    tf.TensorSpec(shape=(None, ), dtype=tf.int32),
+]
 
 '''
   @param vocab_size: dictionary size
@@ -471,17 +463,25 @@ class pBLSTM(tf.keras.layers.Layer):
     # outputs of the forward and backward RNNs will be combined using default: concatenate
     self.blstm = L.Bidirectional(self.lstm) # 2*hidden_dim
 
-  # @tf.function
+  # @tf.function(experimental_relax_shapes=True) # This could remove retracing... but it's still slow...
+  # @tf.function()
+  # @tf.function(input_signature=pblstm_signature) # This remove retracing, but it's even 20ms slower than the 'exp_relax_shape' trick every 10 batches
   def call(self, x_padded, x_lens):
     '''
     param x_padded: padded input, (B, T_max, F)
     param x_lens: actual senquence length (B, ) __TODO
     '''
+    ## TF Function RETRACING DEBUG
+    # print('Tracing with', x_padded)
+    # print("Type of Input: {}; type of Input lens: {}".format(type(x_padded), type(x_lens)))
 
     # Debug
-    # print("Input Batch Shape: ", x_padded.shape)
-    # print("Runtime sequence shape: ", tf.shape(x_padded)[1])
+    # if debug_mode:
+    #   print("Input Batch Shape: ", x_padded.shape)
+    #   print("Runtime Input shape: ", tf.shape(x_padded))
+    #   print("Runtime sequence shape: ", tf.shape(x_padded)[1])
     '''
+      > In a tf.function or when building a model using tf.keras.Input, they return the build-time shape of the tensor, which may be partially unknown.
       Tensor.shape: The returned tf.TensorShape is determined at build time, without executing the underlying kernel. It is not a tf.Tensor. 
       If you need a shape tensor, either convert the tf.TensorShape to a tf.constant, 
       or use the tf.shape(tensor) function, which returns the tensor's shape at execution time.
@@ -493,10 +493,12 @@ class pBLSTM(tf.keras.layers.Layer):
 
     # reshape to (B, T_max*/2, 2*F)
     ## Output shape of 'Reshape': (batch_size,) + target_shape
-    x_paird = L.Reshape(target_shape=(x_padded.shape[1] // 2, x_padded.shape[2] * 2))(x_padded)
+    # x_paird = L.Reshape(target_shape=(x_padded.shape[1] // 2, x_padded.shape[2] * 2))(x_padded)
     # x_paird = L.Reshape(target_shape=(tf.shape(x_padded)[1] // 2, tf.shape(x_padded)[2] * 2))(x_padded)
     ### Temporrary solution using shape inference
+    #### the sequence shape (T_max for current batch) could be unknown during execution (None, build-time shape)
     x_paird = L.Reshape(target_shape=(-1, x_padded.shape[2] * 2))(x_padded)
+    # x_paird = L.Reshape(target_shape=(-1, tf.shape(x_padded)[2] * 2))(x_padded)
 
     reduced_lens = x_lens // 2 # we do the 'chop off'/discard earlier
 
@@ -509,10 +511,14 @@ class pBLSTM(tf.keras.layers.Layer):
     # return the final output ( forward and backward RNNs) for now
     return output, hf, cf, hb, cb, reduced_lens
 
-## Deb
-l = [1, 2, 3]
-print(l)
-print(l[:-1])
+## Dev
+# l = [1, 2, 3]
+# print(l)
+# print(l[:-1])
+
+t = tf.constant([1, 2, 7, 8, 9, 10, 11, 12], shape=[1, 4, 2])
+print(t)
+print(tf.reshape(t, [1, -1, 4]))
 
 blstm = pBLSTM(hidden_dim=2)
 # blstm.summary()
@@ -570,7 +576,8 @@ class Encoder(tf.keras.Model):
 
     ##________ first Bi-LSTM layer in Encoder ------- ##
     ## bottom BLSTM layer
-    self.lstm_1 = L.LSTM(self.enc_units, return_sequences=True, return_state=True, name='Encoder_bilstm') # (B, T, hidden * 2)
+    self.lstm_1 = L.LSTM(self.enc_units, return_sequences=True, return_state=True, name='Encoder_bilstm') 
+    self.blstm_1 = L.Bidirectional(self.lstm_1) # (B, T, hidden * 2)
 
     ## 3 Layers of piramid-BLSTM
     ### to reduce time resolution 2^3 = 8 times; This is critical to allow
@@ -584,6 +591,8 @@ class Encoder(tf.keras.Model):
     self.key_proj = L.Dense(self.key_size, name='enc_key_proj') # (B, T, V/K)
     self.value_proj = L.Dense(self.value_size, name='enc_value_proj') # (B, T, V/K)
 
+    self.relu = L.LeakyReLU(alpha=1e-2)
+
 
   def call(self, x_padded, x_lens, debug_mode=False):
     '''
@@ -592,7 +601,8 @@ class Encoder(tf.keras.Model):
     '''
 
     # (B, T, hidden*2)
-    x_initial, _, _ = self.lstm_1(x_padded) 
+    # x_initial, _, _ = self.lstm_1(x_padded)
+    x_initial, _, _, _, _ = self.blstm_1(x_padded) 
 
     if debug_mode:
       print("Transformed LSTM output: ", x_initial.shape)
@@ -607,7 +617,12 @@ class Encoder(tf.keras.Model):
     key = self.key_proj(x) # (B, T, K)
     value = self.value_proj(x) # (B, T, V)
 
-    return value, key, reduced_lens
+    key_act = self.relu(key)
+    value_act = self.relu(value)
+
+    return value_act, key_act, reduced_lens
+    # return value, key, reduced_lens
+    # return value, reduced_lens # shared key && value proj
 
 ## DEBUG
 encoder_test = Encoder()
@@ -621,6 +636,9 @@ ex_out = encoder_test(ex_input, tf.repeat(25, 32))
 print(ex_out[0].shape) # value
 print(ex_out[1].shape)
 print(ex_out[2]) # 25/2 = 12 (chop off...) 12/2 = 6 6 /2 = 3
+
+print(ex_out[0])
+print(ex_out[1])
 
 """### Attention"""
 
@@ -763,7 +781,7 @@ ex_value = tf.fill([2, 5, 4], 3.0)
 ex_key = tf.fill([2, 5, 4], 4.0) # (B, T, k/v/q)
 att_out, att = attention(ex_query, ex_value, ex_key, test_lens)
 
-print(att_out.shape)
+print(att_out)
 print(att.shape)
 print(tf.reduce_sum(att, axis=1))
 print(att)
@@ -821,12 +839,14 @@ class Decoder(tf.keras.Model):
 
 
   # @tf.function
-  def call(self, x, value=None, key=None, hidden=None, encoder_lens=None, teacher_force=False, teacher_forcing_rate=0.1, debug_mode=False):
+  # TODO: the input sequence length could be unknown during execution (None), need a RNN cell module to optimize this part
+  def call(self, x, value=None, key=None, hidden=None,  encoder_lens=None, ini_context=None, teacher_force=False, teacher_forcing_rate=0.1, debug_mode=False, if_generate=False):
     '''
     :param x: (B, L_max) [ground-trouth, D] input transcrip sequence
     :param value: (B, T_max, enc_size); high-level feature representation of encoder projection, h
     :param key: (B, T_max, key_size); separate projection of encoder high level representation H
     :param encoder_lens: (B, ); actual lens of utterences (might be shrinked in)
+    :param ini_context; c-1 or c(i-1), not needed during generate or training mode
     :TODO, separately projected key of encoder
     :param hidden: s-1, tuple of (hidden_state, cell_state)
     :     update: list of state tuple (hidden_state, cell_state) for each decoder rnn layer
@@ -856,8 +876,9 @@ class Decoder(tf.keras.Model):
     if debug_mode:
       print("Input Embedding: ", x)
 
-    logits = []
+    logits = [] # TODO,  use tf.TensorArray to accumulate results from a dynamically unrolled loop.
 
+    # (B, V)
     char_dis = tf.zeros([batch_size, self.vocab_size])
 
     # Sampled Attention Matrix (L_max, T_max) for one instance of the batch
@@ -866,10 +887,20 @@ class Decoder(tf.keras.Model):
 
     # The intial contexct ci-1 (B, C/V)
     ### initialize use the first value of the encoder feature representation H sequences
+    #### This seems bad...
     ### TODO: blend with the initial rnn hidden states?
     # if debug_mode:
       # print("Encoder H: ", value)
-    context = value[:,0,:] # H[0]
+    # context = value[:,0,:] # H[0]
+
+    ## C-1
+    ## If no initial context provided use initial context of 0's
+    context = tf.zeros((batch_size, tf.shape(value)[2]))
+    if ini_context != None:
+      context = ini_context
+
+    if debug_mode:
+      print("c_-1: {}, type: {}".format(context, type(context)))
 
     for i in range(L):
       # for each timestamp
@@ -885,10 +916,14 @@ class Decoder(tf.keras.Model):
         teacher_forcing = True if np.random.random_sample() > teacher_forcing_rate else False
         # Use Ground Truth
         if teacher_forcing:
+          if debug_mode:
+            print("Using input ground truth")
           char_embed = x[:, i, :]
         else:
           # Apply Gumbel Noise to simulate a sample from discrete distribution
           if i==0:
+            if debug_mode:
+              print("Using input ground truth")
             # no predicted char distribution yet
             char_embed = x[:, i, :]
           else:
@@ -907,10 +942,22 @@ class Decoder(tf.keras.Model):
               print("Gumbel samples shape: {}, \n Sanity check on row sums: {} \n Char Embedding shape: {}".format(gumbel_samples.shape, tf.reduce_sum(gumbel_samples, axis=-1).numpy(), char_embed.shape))
 
       else:
-        # (B, E), for current ts
-        if debug_mode:
-          print("Using input ground truth")
-        char_embed = x[:, i, :]
+        if if_generate==False: # Simple training using ground truth
+          # (B, E), for current ts
+          if debug_mode:
+            print("Using input ground truth")
+          char_embed = x[:, i, :]
+        else:
+          if i==0:
+            if debug_mode:
+              print("Using input ground truth")
+            # no predicted char distribution yet
+            char_embed = x[:, i, :]
+          else:
+            # the raw logits from previvous step: (B, V)
+            # (B, E)
+            char_embed = self.embedding(tf.math.argmax(char_dis, axis=-1))
+
 
       if debug_mode:
         print("TS: {}, embedding used: {}".format(i, char_embed))
@@ -919,7 +966,8 @@ class Decoder(tf.keras.Model):
       ### out/query (B, dec_hidden)
       ### Decoder input (to the first rnn cell) at every timestep is the concatenated character embedding and attention context vector 
       ### si = RNN(si-1, [yi-1, ci-1]))
-
+      if debug_mode:
+        print("c_i-1: {}, type: {}".format(context, type(context)))
       ### concatenate embedding and context vector: (B, E|value_size/context_size)
       dec_rnn_input = tf.keras.layers.concatenate([char_embed, context], axis=-1)
       # if debug_mode:
@@ -937,18 +985,18 @@ class Decoder(tf.keras.Model):
 
       hidden_states[1] = lstm2_states
 
-      if debug_mode:
-        # Out == states[0]
-        print("LSTM out", lstm1_out.shape)
-        print(lstm1_out.numpy())
-        print(type(lstm1_states))
-        print(len(lstm1_states))
-        print(lstm1_states[0])
-        print(lstm1_states[1])
+      # if debug_mode:
+      #   # Out == states[0]
+      #   print("LSTM out", lstm1_out.shape)
+      #   print(lstm1_out.numpy())
+      #   print(type(lstm1_states))
+      #   print(len(lstm1_states))
+      #   print(lstm1_states[0])
+      #   print(lstm1_states[1])
 
-        print("LSTM final out: ", out)
-        print(lstm2_states[0])
-        print(lstm2_states[1])
+      #   print("LSTM final out: ", out)
+      #   print(lstm2_states[0])
+      #   print(lstm2_states[1])
 
       ## 3. get context vector using query and key
       ### context: (B, value_size/enc_size/dec_size)
@@ -987,7 +1035,7 @@ class Decoder(tf.keras.Model):
 
     # return lstm next hidden state && cell state for each element in the batch: (B, dec_H)
     #  use stack to concatenate along a new axis 
-    return output, hidden_states, tf.stack(attention_sample, axis=0)
+    return output, hidden_states, tf.stack(attention_sample, axis=0), context
 
 ## DEV
 tf.repeat(50, 32)
@@ -999,7 +1047,7 @@ tf_out, tf_hidden, tf_att_sample = decoder_tf(example_batch[1], value=tf.ones([3
 
 # Debug
 decoder_ = Decoder(len(LETTER_LIST), 100, 128)
-example_dec_output, example_dec_next_states, att_sample= decoder_(example_batch[1], value=tf.ones([32, 201, 128]), key=tf.ones([32, 201, 128]),hidden=None, encoder_lens=tf.repeat(50, 32), debug_mode=False)
+example_dec_output, example_dec_next_states, att_sample= decoder_(example_batch[1], value=tf.ones([32, 201, 128]), key=tf.ones([32, 201, 128]),hidden=None, encoder_lens=tf.repeat(50, 32), debug_mode=True)
 
 # DEV
 ## GUMBEL NOISE
@@ -1045,7 +1093,7 @@ encoder = Encoder(hidden_dim=256, value_size=128, key_size=128)
 example_enc_output = encoder(example_batch[0], example_batch[2])
 
 print(example_enc_output[0].shape) # (B, T_max/8, value_size)
-print(example_enc_output[1].shape) # (B, T_max/8, key_size)
+# print(example_enc_output[1].shape) # (B, T_max/8, key_size)
 # print(example_enc_output[1].shape)
 # print(example_enc_output[2].shape)
 
@@ -1054,8 +1102,9 @@ print(example_enc_output[1].shape) # (B, T_max/8, key_size)
 # print(dec_ini_h.shape)
 # print(dec_ini_c.shape)
 
-# reduced_enc_lens =  example_enc_output[5]       # Actual sequence lengths of encoder hidden representations H
-reduced_enc_lens = example_enc_output[2]
+# Actual sequence lengths of encoder hidden representations H
+reduced_enc_lens = example_enc_output[2] # if key is present
+# reduced_enc_lens = example_enc_output[1]
 print(reduced_enc_lens.shape) # (B,)
 # print(example_enc_output[0].numpy()[:, -1, :].shape)
 # print(example_enc_output[1].numpy())
@@ -1071,7 +1120,9 @@ decoder = Decoder(len(LETTER_LIST), embed_dim=256, dec_hidden=512, query_size=12
 ## Initial Hidden states list as zero filled
 # initial_hidden = [dec_ini_h, dec_ini_c]
 initial_hidden = None
-ex_dec_output, ex_dec_next_states, ex_dec_att_sample = decoder(example_batch[1], value=example_enc_output[0], key=example_enc_output[1], hidden=initial_hidden, encoder_lens=reduced_enc_lens, debug_mode=False)
+ex_dec_output, ex_dec_next_states, ex_dec_att_sample, _ = decoder(example_batch[1], value=example_enc_output[0], key=example_enc_output[1], hidden=initial_hidden, encoder_lens=reduced_enc_lens, debug_mode=False) # Separate key and value projs
+# ex_dec_output, ex_dec_next_states, ex_dec_att_sample = decoder(example_batch[1], value=example_enc_output[0],  hidden=initial_hidden, encoder_lens=reduced_enc_lens, debug_mode=False)
+
 
 print(ex_dec_output.shape)
 print(ex_dec_output.numpy()[0])
@@ -1085,17 +1136,22 @@ print(type(ex_dec_next_states))
 
 # print(ex_dec_att_sample[0])
 print(tf.reduce_sum(tf.cast(ex_dec_att_sample[0] > 0.0, tf.int32)))
-print(reduced_enc_lens[0])
+print(reduced_enc_lens[0]) # T_actual/8 for the first utterencee
 print(example_enc_output[0].shape) # (B, T_reduced, value_size)
+
+# Plot the dummy attention map
+plt.matshow(ex_dec_att_sample)
+plt.show()
 
 ###[Optional] Load Existing model weights
 local_dir = './colab_storage'
 drive_dir = './drive/MyDrive'
-encoder_cp_dir = local_dir + '/LAS/weights/encoder'  # './drive/MyDrive/LAS/weights/encoder'
-decoder_cp_dir = local_dir + '/LAS/weights/decoder' #'./drive/MyDrive/LAS/weights/decoder'
+encoder_train_cp_dir = local_dir + '/LAS/train/weights/encoder'  # './drive/MyDrive/LAS/weights/encoder'
+decoder_train_cp_dir = local_dir + '/LAS/train/weights/decoder' #'./drive/MyDrive/LAS/weights/decoder'
 
-encoder.load_weights(encoder_cp_dir)
-decoder.load_weights(decoder_cp_dir)
+###[Optional] Load Existing under-training model checkpoints/weights
+encoder.load_weights(encoder_train_cp_dir)
+decoder.load_weights(decoder_train_cp_dir)
 
 """##### (Check) Initial States before training"""
 
@@ -1110,6 +1166,7 @@ l_t[:-1]
 
 """## Train"""
 
+# @tf.function
 def plot_grad_flow(grads_and_vars):
   '''
   input (gradients, trainable_variables)
@@ -1195,7 +1252,9 @@ def loss_function(real, pred, target_mask):
   # return sum of losses of B x L_Max
   return tf.reduce_sum(masked_loss), tf.reduce_sum(loss)
 
-optimizer = tf.keras.optimizers.Adam()
+print(1e-3)
+optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
+# optimizer = tf.keras.optimizers.Adam()
 
 ### TODO: under tf.function, get runtime sequence shape (errors under 'None' runtime value, both L_max and T_max)
 # @tf.function( experimental_relax_shapes=True)
@@ -1226,8 +1285,8 @@ def train_step(input, target, input_lens, target_mask, tf_rate=0.1):
     # ini_hidden = [dec_ini_h, dec_ini_c]
     ini_hidden = None # use zero-filled initial hidden states
 
-    # reduced_enc_lens = enc_output[5]
-    reduced_enc_lens = enc_output[2]
+    reduced_enc_lens = enc_output[2] # separate key && value
+    # reduced_enc_lens = enc_output[1]
 
     # attach previous removed '<sos>' #TODO, remove this
     # Ignore '<eos>'
@@ -1244,7 +1303,8 @@ def train_step(input, target, input_lens, target_mask, tf_rate=0.1):
     # pred, dec_h, dec_c = decoder(dec_input, [enc_h, enc_c]) # input targets
     ## Apply 10% teacher forcing rate
     # Separate Key and Value projection
-    pred, dec_next_states, attention_sample = decoder(dec_input, value=enc_output[0],  key=enc_output[1], hidden=ini_hidden, encoder_lens=reduced_enc_lens, teacher_force=True, teacher_forcing_rate=tf_rate)
+    pred, dec_next_states, attention_sample, _ = decoder(dec_input, value=enc_output[0],  key=enc_output[1], hidden=ini_hidden, encoder_lens=reduced_enc_lens, teacher_force=True, teacher_forcing_rate=tf_rate)
+    # pred, dec_next_states, attention_sample = decoder(dec_input, value=enc_output[0],  hidden=ini_hidden, encoder_lens=reduced_enc_lens, teacher_force=True, teacher_forcing_rate=tf_rate)
     
     loss, unmasked_loss = loss_function(target, pred, target_mask)
 
@@ -1264,10 +1324,11 @@ np.set_printoptions(threshold=100)
 debug_mode = False
 
 
-EPOCHS = 10
+EPOCHS = 5
 data = result_train # dev dataset: result
 for epoch in range(EPOCHS):
   start = time.time()
+  time_cp = start
   # Epoch aggregation
   total_loss = 0
   total_words = 0 # total_labels
@@ -1278,9 +1339,8 @@ for epoch in range(EPOCHS):
     # print('Batch # {}'.format(batch))
     # Debug
     # print(type(inp), type(targ), type(input_lens), type(target_lens))
-    # print(inp.shape)
-    # print(targ.shape)
     # print(target_lens)
+    # print("Utterence Shape: {}, Target Shape: {}; Utter lens shape: {}, Target lens shape: {}".format(inp.shape, targ.shape, input_lens.shape, target_lens.shape))
     # Generate mask before hand
     # Mask based on target lens
     # TODO: put into generate loss function
@@ -1321,13 +1381,17 @@ for epoch in range(EPOCHS):
     batch_perplex = tf.math.exp(loss_per_word)
 
     if batch % 10 == 0:
-      print('Epoch {} Batch {} Loss {:.4f}; [Debug] Unmasked Loss: {:.4f}; Loss per word: {:.4f}; Perplexity (exp of loss_per_word): {:.5f}'.format(epoch + 1,
+      period_runtime = time.time() - time_cp
+      time_cp = time.time()
+      print('Epoch {} Batch {} Loss {:.4f}; [Debug] Unmasked Loss: {:.4f}; Loss per word: {:.4f}; Perplexity (exp of loss_per_word): {:.5f}; || Runtime CheckPoint: {:.4f}'.format(epoch + 1,
                                                    batch,
                                                    batch_loss, batch_unmasked_loss,
-                                                   loss_per_word, batch_perplex))
+                                                   loss_per_word, batch_perplex,
+                                                   period_runtime))
                                                   #  batch_loss.numpy())) # tf function
       # [Sanity Check x] Plot Gradient Flow
       if batch % 50 == 0:
+        # TODO: move this to validation step completely?
         plt = plot_grad_flow(grads_vars)
 
         plt.show()
@@ -1346,12 +1410,14 @@ for epoch in range(EPOCHS):
         # dec_ini_h = tf.concat([enc_output[1], enc_output[3]], axis=1)
         # dec_ini_c = tf.concat([enc_output[2], enc_output[4]], axis=1)
 
-        reduced_enc_lens = enc_output[2]
+        reduced_enc_lens = enc_output[2] # Separate Key and Value projs
+        # reduced_enc_lens = enc_output[1]
 
     
         dec_input = tf.pad(targ[:, :-1], [[0, 0], [1, 0]], "CONSTANT", constant_values=letter2index['<sos>'])
     
-        pred, dec_next_states, attention_sample = decoder(dec_input, value=enc_output[0], key=enc_output[1], hidden=None, encoder_lens=reduced_enc_lens, teacher_force=True, teacher_forcing_rate=1.0) # take sample from previous ts output distributions all the time
+        pred, dec_next_states, attention_sample, _ = decoder(dec_input, value=enc_output[0], key=enc_output[1], hidden=None, encoder_lens=reduced_enc_lens, teacher_force=True, teacher_forcing_rate=1.0) # take sample from previous ts output distributions all the time
+        # pred, dec_next_states, attention_sample = decoder(dec_input, value=enc_output[0], hidden=None, encoder_lens=reduced_enc_lens, teacher_force=True, teacher_forcing_rate=1.0) # take sample from previous ts output distributions all the time
         ## TODO: enable random search or beam_search during validation
 
         # Pred: (B, L_max, target_vocab_size )
@@ -1384,6 +1450,12 @@ for epoch in range(EPOCHS):
   print('Epoch {} Loss per Batch{:.4f}, after {} steps; Epoch loss per word: {:.4f}, Epoch Perplexity: {:.5f}'.format(epoch + 1,
                                       total_loss / steps_per_epoch, steps_per_epoch, total_loss/total_words, tf.math.exp(total_loss/total_words)))
   print('Time taken for 1 epoch {} sec\n'.format(time.time() - start)) # CPU: 86s for dev_data
+
+  ## Save the Model Checkpoints (Model Weights for now)
+  print("==================Saving Model Weights...======================")
+
+  encoder.save_weights(encoder_train_cp_dir, overwrite=True, save_format='tf')
+  decoder.save_weights(decoder_train_cp_dir, overwrite=True, save_format='tf')
 
   # Resource Monitoring
   monitor_gpu()
@@ -1443,12 +1515,13 @@ r_.numpy()
 """
 
 # # Checkpoint directories
-# local_dir = './colab_storage'
-# encoder_cp_dir = local_dir + '/LAS/weights/encoder'  # './drive/MyDrive/LAS/weights/encoder'
-# decoder_cp_dir = local_dir + '/LAS/weights/decoder' #'./drive/MyDrive/LAS/weights/decoder'
+local_dir = './colab_storage'
+encoder_cp_dir = local_dir + '/LAS/weights/encoder'  # './drive/MyDrive/LAS/weights/encoder'
+decoder_cp_dir = local_dir + '/LAS/weights/decoder' #'./drive/MyDrive/LAS/weights/decoder'
 
 # inf_encoder = pBLSTM(hidden_dim=64)
-inf_encoder =  Encoder(hidden_dim=256, value_size=128)
+inf_encoder =  Encoder(hidden_dim=256, value_size=128, key_size=128)
+# inf_encoder.build(input_shape=tf.TensorShape([None, None, 40])) # Currently, you cannot build your model if it has positional or keyword arguments that are not inputs to the model,
 
 # inf_encoder(example_batch[0])
 inspect_wieghts(inf_encoder)
@@ -1463,7 +1536,7 @@ inspect_wieghts(inf_decoder)
 inf_decoder.load_weights(decoder_cp_dir)
 inspect_wieghts(inf_decoder)
 
-print(example_dec_output.shape) # （B, T_max, vocab_size)
+# print(example_dec_output.shape) # （B, T_max, vocab_size)
 # print(example_dec_output)
 
 """###### Load Test Data"""
@@ -1589,11 +1662,12 @@ ds = sorted(d.items(), key=lambda x: x[1], reverse=True)
 print(ds)
 print(type(ds))
 
-def prune(paths_seq, paths_idx, paths_score, paths_states, beam_width=10, debug_mode=True):
+def prune(paths_seq, paths_idx, paths_score, paths_states, paths_contexts, beam_width=10, debug_mode=True):
   pruned_paths_seq = set()
   pruned_paths_idx = {}
   pruned_paths_score = {}
   pruned_paths_states = {}
+  pruned_paths_contexts = {}
   best_path = '<eos>'
 
   if debug_mode:
@@ -1617,12 +1691,13 @@ def prune(paths_seq, paths_idx, paths_score, paths_states, beam_width=10, debug_
       pruned_paths_idx[p] = paths_idx[p]
       pruned_paths_score[p] = paths_score[p]
       pruned_paths_states[p] = paths_states[p]
+      pruned_paths_contexts[p] = paths_contexts[p]
 
       # record current best scored Path
       if paths_score[p] == score_list[0]:
         best_path = p
 
-  return pruned_paths_seq, pruned_paths_idx, pruned_paths_score, pruned_paths_states, best_path
+  return pruned_paths_seq, pruned_paths_idx, pruned_paths_score, pruned_paths_states, pruned_paths_contexts, best_path
 
 ## Apply inference stage model(s)
 def val_beam(num_samples=2, max_seq=20):
@@ -1779,6 +1854,7 @@ print(len(ps), ps)
 
 """
 
+## Debug
 for i, (utter, _, utter_len, _) in enumerate(batched_ds_test):
   print(utter.shape)
   print(utter_len)
@@ -1787,13 +1863,13 @@ for i, (utter, _, utter_len, _) in enumerate(batched_ds_test):
 # For debug
 np.set_printoptions(threshold=100)
 
-max_seq = 100;
+max_seq = 250;
 debug_mode = False
 
 
 res = []
 
-for i, (utter, _, utter_len, _) in enumerate(batched_ds_test.take(1)):
+for i, (utter, _, utter_len, _) in enumerate(batched_ds_test):
   print("===================================Raw Utterance {}: ===================================\n {}".format(i, utter.numpy()))
   # Invoke Encoder
     # enc_output, enc_h, enc_c =  encoder(utter)
@@ -1805,7 +1881,7 @@ for i, (utter, _, utter_len, _) in enumerate(batched_ds_test.take(1)):
   # enc_c = tf.concat([enc_output[2], enc_output[4]], axis=1)
 
   # enc_reduced_len = enc_output[5]
-  enc_reduced_len = enc_output[1]
+  enc_reduced_len = enc_output[2] # separate key, value proj
 
   # Encoder output for current utterance, Hidden/High level representation H
   # Preparation
@@ -1814,6 +1890,7 @@ for i, (utter, _, utter_len, _) in enumerate(batched_ds_test.take(1)):
   beam_idx = {}
   pathscore = {}
   states = {}
+  contexts = {} # Important, c-1/c_i-1
   best_path = path # dummy initial
 
   beam_seq.add(path)
@@ -1821,6 +1898,7 @@ for i, (utter, _, utter_len, _) in enumerate(batched_ds_test.take(1)):
   pathscore[path] = 1.0
   # states[path] =  [enc_h, enc_c]
   states[path] = None # initialize with zero-filled initial_states for all Decoder rnn layer(s)
+  contexts[path] = None # initial context of 0's
 
 
   print('Initial Beam sequence: ', beam_seq)
@@ -1836,6 +1914,7 @@ for i, (utter, _, utter_len, _) in enumerate(batched_ds_test.take(1)):
     n_beam_idx = {}
     n_pathscore = {}
     n_states = {}
+    n_contexts = {}
 
     # 0. 'Tenure' the already terminated sequence(s)
     viable_beam_seq = set()
@@ -1846,9 +1925,14 @@ for i, (utter, _, utter_len, _) in enumerate(batched_ds_test.take(1)):
         ## if current top scored path terminates with '<eos>', put it into candidates
         if path == best_path:
           print("Current Best Path: {} ended, put into candidates list...".format(best_path))
+          # Early Stopping after find best path terminates in '<eos>' ...
           terminated_seqs[path] = pathscore[path]
+          break
       else:
         viable_beam_seq.add(path)
+
+    if len(terminated_seqs) > 0:
+      break # early stop
 
     # 1. expore each path in beam
     for path in viable_beam_seq: #beam_seq:
@@ -1868,6 +1952,11 @@ for i, (utter, _, utter_len, _) in enumerate(batched_ds_test.take(1)):
       else:
         hpath = None
 
+      if contexts[path] != None:
+        path_context = tf.identity(contexts[path])
+      else:
+        path_context = None
+
       if debug_mode:
         print("-------------------States: ")
         for state_path in states.items():
@@ -1876,7 +1965,7 @@ for i, (utter, _, utter_len, _) in enumerate(batched_ds_test.take(1)):
       #   print("Input Hidden States: ", hpath)
       #   print("Input Reduced Lens: ", enc_reduced_len)
       # TODO: this part can be Batched for all paths
-      pred, next_states, _ = inf_decoder(cfin, value=enc_output[0], hidden=hpath, encoder_lens=enc_reduced_len, debug_mode=False)
+      pred, next_states, _, next_contexts = inf_decoder(cfin, value=enc_output[0], key=enc_output[1], hidden=hpath, encoder_lens=enc_reduced_len, ini_context=path_context, debug_mode=False)
       if debug_mode:
         print("Next States Generated for {}: {}".format(cfin, next_states))
       # $$$ TODO plot the attention for beam search?
@@ -1912,6 +2001,7 @@ for i, (utter, _, utter_len, _) in enumerate(batched_ds_test.take(1)):
         # n_pathscore[new_path] = pathscore[path] * tf.squeeze(pred).numpy()[letter2index[c]] # y[c]
         n_pathscore[new_path] = pathscore[path] * Y.numpy()[letter2index[c]] # y[c]
         n_states[new_path] = next_states
+        n_contexts[new_path] = next_contexts
 
         n_beam_seq.add(new_path)
 
@@ -1926,7 +2016,7 @@ for i, (utter, _, utter_len, _) in enumerate(batched_ds_test.take(1)):
     #   for state_path in n_states.items():
     #     print("Path: {}, states: {}".format(state_path[0], state_path[1]))
 
-    beam_seq, beam_idx, pathscore, states, best_path = prune(n_beam_seq, n_beam_idx, n_pathscore, n_states, debug_mode=debug_mode, beam_width=10)
+    beam_seq, beam_idx, pathscore, states, contexts, best_path = prune(n_beam_seq, n_beam_idx, n_pathscore, n_states, n_contexts, debug_mode=debug_mode, beam_width=10)
 
     if debug_mode:
       print("All Pruned next states: ")
@@ -1940,10 +2030,14 @@ for i, (utter, _, utter_len, _) in enumerate(batched_ds_test.take(1)):
 
 
   # list(word_freq.items())[0][1]
-  print("Top Paths with Score: ", top_paths)
+  print("Top Paths with Score: ", top_paths[:4])
   print("Top Terminated Paths with Score: ", top_terminated_paths)
 
-  best_path_raw_str, best_path_score = top_paths[0]
+  if len(top_terminated_paths) == 0:
+    best_path_raw_str, best_path_score = top_paths[0]
+  else:
+    best_path_raw_str, best_path_score = top_terminated_paths[0]
+  
   best_path_raw_idx = beam_idx[best_path_raw_str]
 
   print("Raw Prediction sequence {}, idices: {}".format(best_path_raw_str, best_path_raw_idx))
@@ -1955,17 +2049,17 @@ for i, (utter, _, utter_len, _) in enumerate(batched_ds_test.take(1)):
   res.append(spell)
 
 ### Greedy Search
-max_seq = 100
+max_seq = 250
 res = []
 debug_mode = False
 
-for i, (utter, _, utter_len, _) in enumerate(batched_ds_test.take(1)):
+for i, (utter, _, utter_len, _) in enumerate(batched_ds_test):
   print("===================================Raw Utterance {}: ===================================\n {}".format(i, utter.numpy()))
   # Invoke Encoder
 
   enc_output = inf_encoder(utter, utter_len)
 
-  enc_reduced_len = enc_output[1]
+  enc_reduced_len = enc_output[2] # separate key and value proj
 
   # enc_h = tf.concat([enc_output[1], enc_output[3]], axis=1)
   # enc_c = tf.concat([enc_output[2], enc_output[4]], axis=1)
@@ -1981,6 +2075,9 @@ for i, (utter, _, utter_len, _) in enumerate(batched_ds_test.take(1)):
   # h_state = enc_h
   # c_state = enc_c
   states = None
+
+  # Initial Context, c-1, c0
+  context = None
 
   attention = []
 
@@ -2000,7 +2097,8 @@ for i, (utter, _, utter_len, _) in enumerate(batched_ds_test.take(1)):
         print("Input Label: ", dec_input)
         print("Input Hidden States: ", states)
         print("Input Reduced Lens: ", enc_reduced_len)
-    pred, next_states, att_step = inf_decoder(dec_input, value=enc_output[0], hidden=states, encoder_lens=enc_reduced_len, debug_mode=False)
+    # the input context is always zero... if we 'run_one_step'
+    pred, next_states, att_step, context = inf_decoder(dec_input, value=enc_output[0], key=enc_output[1], hidden=states, encoder_lens=enc_reduced_len, ini_context=context, debug_mode=False)
 
     # (1, Utter_len)
     attention.append(att_step)
@@ -2025,6 +2123,7 @@ for i, (utter, _, utter_len, _) in enumerate(batched_ds_test.take(1)):
 
   decoded = transform_index_to_letter([seq_index], [letter2index['<eos>'], letter2index['<pad>']], igonre_idxs=[letter2index['<sos>']])
   print("Raw Prediction sequence :", seq)
+  print("Raw Prediction sequence(indices) :", seq_index)
   print("Predicted Transcript: ", decoded)
   att_sample = tf.concat(attention, axis=0)
   print("Attention: ", att_sample.shape)
@@ -2033,23 +2132,15 @@ for i, (utter, _, utter_len, _) in enumerate(batched_ds_test.take(1)):
 
 
   res.append(decoded)
-  # print("Raw Prediction sequence(indices) :", pred_trans)
-  # print("Predicted Transcript: ", pred_text)
-  # print(pred_text[0])
-
-  # Plot attention
-
-
-  # res.append(pred_text[0])
 
 ### Greedy Search with Gumbel
 np.set_printoptions(threshold=100)
 
-max_seq = 250
+max_seq = 100 # 250
 res = []
 debug_mode = False
 
-for i, (utter, _, utter_len, _) in enumerate(batched_ds_test):
+for i, (utter, _, utter_len, _) in enumerate(batched_ds_test.take(1)):
   print("===================================Raw Utterance {}: ===================================\n {}".format(i, utter.numpy()))
   # Invoke Encoder
 
@@ -2077,7 +2168,7 @@ for i, (utter, _, utter_len, _) in enumerate(batched_ds_test):
   ## TEMP Solution
   dec_input = tf.fill([1, max_seq], letter2index['<sos>']) # start of sequence # (1, 1)
 
-  pred, dec_next_states, attention_sample = inf_decoder(dec_input, value=enc_output[0], key=enc_output[1], hidden=None, encoder_lens=enc_reduced_len, teacher_force=True, teacher_forcing_rate=1.0) # take sample from previous ts output distributions all the time
+  pred, dec_next_states, attention_sample = inf_decoder(dec_input, value=enc_output[0], key=enc_output[1], hidden=None, encoder_lens=enc_reduced_len, teacher_force=True, teacher_forcing_rate=1.0, debug_mode=True) # take sample from previous ts output distributions all the time
 
   # Greedy Decode
   pred_trans = tf.math.argmax(pred, axis=-1)
@@ -2120,6 +2211,75 @@ for i, (utter, _, utter_len, _) in enumerate(batched_ds_test):
   plt.show()
 
   res.append(pred_text[0])
+
+## Greedy Search Debug
+
+
+max_seq = 250 # 250
+res = []
+debug_mode = False
+
+for i, (utter, _, utter_len, _) in enumerate(batched_ds_test.take(1)):
+  print("===================================Raw Utterance {}: ===================================\n {}".format(i, utter.numpy()))
+  # Invoke Encoder
+
+  enc_output = inf_encoder(utter, utter_len)
+
+  enc_reduced_len = enc_output[2]
+
+  
+  seq = ['<sos>']
+  seq_index = [letter2index['<sos>']]
+  # initial Decoder State
+  ## Use zero-filled initial states
+
+  states = None
+
+  ## TEMP Solution
+  dec_input = tf.fill([1, max_seq], letter2index['<sos>']) # start of sequence # (1, 1)
+
+  pred, dec_next_states, attention_sample, _ = inf_decoder(dec_input, value=enc_output[0], key=enc_output[1], hidden=None, encoder_lens=enc_reduced_len, teacher_force=False, if_generate=True, debug_mode=True) # take the max prob char from previous ts distribution
+
+  # Greedy Decode
+  pred_trans = tf.math.argmax(pred, axis=-1)
+
+  pred_text = transform_index_to_letter(pred_trans.numpy(), [letter2index['<eos>'], letter2index['<pad>']], igonre_idxs=[letter2index['<sos>']])
+
+  # while tf.squeeze(dec_input).numpy() != letter2index['<eos>'] and len(seq) < max_seq:
+
+  #   pred, next_states, _ = inf_decoder(dec_input, value=enc_output[0], hidden=states, encoder_lens=enc_reduced_len)
+
+  #   # h_state = next_states[0]
+  #   # c_state = next_states[1]
+  #   states = next_states
+
+  #   # pred: (1, 1, 35/vocab_size)
+  #   if debug_mode:
+  #     print("step: {}".format(len(seq)))
+  #     print("current seq: ", seq)
+  #     print("pred: ", pred.numpy())
+  #     print("SoftMax pred: ", tf.nn.softmax(tf.squeeze(pred)).numpy())
+
+
+  #   # $$ Greedy Search
+  #   next_input =  tf.math.argmax(tf.squeeze(pred), axis=-1)
+  #   dec_input = tf.fill([1,1], next_input)
+  #   seq.append(index2letter[next_input.numpy()])
+  #   seq_index.append(next_input.numpy())
+
+  # decoded = transform_index_to_letter([seq_index], [letter2index['<eos>'], letter2index['<pad>']], igonre_idxs=[letter2index['<sos>']])
+  # print("Raw Prediction sequence :", seq)
+  # print("Predicted Transcript: ", decoded)
+
+  # res.append(decoded)
+  print("Raw Prediction sequence(indices) :", pred_trans)
+  print("Predicted Transcript: ", pred_text)
+  print(pred_text[0])
+  print(attention_sample.shape)
+
+  # Plot attention
+  plt.matshow(attention_sample)
+  plt.show()
 
 """#### Random Search"""
 
