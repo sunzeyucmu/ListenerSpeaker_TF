@@ -17,6 +17,15 @@ https://www.tensorflow.org/install/gpu#software_requirements
 https://docs.nvidia.com/deeplearning/cudnn/install-guide/index.html#installwindows
 """
 
+# !ls ./drive/MyDrive/LAS/hw4_data/
+
+# Colab
+!pip install Levenshtein
+source_data_path = './drive/MyDrive/LAS/hw4_data/'
+
+#Local
+source_data_path = 'hw4_data/'
+
 # Commented out IPython magic to ensure Python compatibility.
 # Install TensorFlow
 # !pip install -q tensorflow-gpu==2.0.0-beta1
@@ -185,7 +194,7 @@ def transform_index_to_letter(index, stopIdxs, igonre_idxs=[]):
         index_to_letter_list.append(curr)
     return index_to_letter_list
 
-data_path = 'hw4_data/'
+data_path =  source_data_path #'hw4_data/'
 speech_train, speech_dev, speech_test, transcript_train, transcript_dev = load_data(data_path)
 
 ## Debug
@@ -312,24 +321,24 @@ batched_ds_train = ds_train_shuffle.padded_batch(32) # OOM DEBUG # BATCH_SIZE = 
 
 batched_ds_test = ds_test.batch(1)
 
-print(len(list(batched_ds.as_numpy_iterator())))
-### Generator Padded inputs
-for batch in batched_ds.take(1):
-  print(type(batch))
-  print(type(batch[0]))
-  print(batch[0].shape)
-  print(batch[0][0].numpy()) # first utterance (T, C/F=40)
-  print(batch[2].shape)
-  print(batch[2].numpy())
+# print(len(list(batched_ds.as_numpy_iterator())))
+# ### Generator Padded inputs
+# for batch in batched_ds.take(1):
+#   print(type(batch))
+#   print(type(batch[0]))
+#   print(batch[0].shape)
+#   print(batch[0][0].numpy()) # first utterance (T, C/F=40)
+#   print(batch[2].shape)
+#   print(batch[2].numpy())
 
 
-for batch in batched_ds_train.take(1):
-  print(type(batch))
-  print(type(batch[0]))
-  print(batch[0].shape)
-  print(batch[0][0].numpy()) # first utterance (T, C/F=40)
-  print(batch[2].shape)
-  print(batch[2].numpy())
+# for batch in batched_ds_train.take(1):
+#   print(type(batch))
+#   print(type(batch[0]))
+#   print(batch[0].shape)
+#   print(batch[0][0].numpy()) # first utterance (T, C/F=40)
+#   print(batch[2].shape)
+#   print(batch[2].numpy())
 
 print(len(list(batched_ds_test.as_numpy_iterator())))
 for batch in batched_ds_test.take(1):
@@ -1427,6 +1436,115 @@ for example in result.take(1):
   print(example[2])
   print(example[2]//8)
 
+"""#### pBLSTM Compression Block"""
+
+class pBLSTM_block(tf.keras.layers.Layer):
+  def __init__(self, hidden_dim):
+    super(pBLSTM_block, self).__init__()
+    
+    self.hidden_dim = hidden_dim
+    ##________ Bi-LSTM layer ------- ##
+    self.lstm = L.LSTM(self.hidden_dim, return_sequences=True, return_state=True, name='pBLSTM_lstm')
+    # outputs of the forward and backward RNNs will be combined using default: concatenate
+    self.blstm = L.Bidirectional(self.lstm) # 2*hidden_dim
+
+
+  def call(self, x_padded, x_lens=None):
+    '''
+    param x_padded: padded input, (B, T_max, F/C)
+    param x_lens: actual senquence length (B, ) __TODO
+    '''
+    # chop off extra odd timestamp
+    # x_padded = x_padded[:, :(x_padded.shape[1] // 2) * 2, :] # (B, T_max*, F)
+    x_padded = x_padded[:, :(tf.shape(x_padded)[1] // 2) * 2, :] # (B, T_max*, F)
+    # print("Chop off :", x_padded.shape)
+
+    # reshape to (B, T_max*/2, 2*F)
+    ## Output shape of 'Reshape': (batch_size,) + target_shape
+
+    x_paird = L.Reshape(target_shape=(-1, x_padded.shape[2] * 2))(x_padded)
+    # x_paird = L.Reshape(target_shape=(-1, tf.shape(x_padded)[2] * 2))(x_padded)
+
+
+    # print("REshaped: ", x_paird.shape)
+
+    # Output of Nets, [Forward Net States pair], [Backward Net States pair]
+    ### Notice hb, cb corresponding to T=0 in Forward Net $$$
+    output, hf, cf, hb, cb = self.blstm(x_paird) # (B, T_max*/2, 2*H)
+    
+    # return the final output ( forward and backward RNNs) for now
+    return output, hf, cf, hb, cb
+
+## Dev
+sample_pblstm = pBLSTM_block(hidden_dim=256)
+
+# (B, T*/2, 2*H)
+ex_pblstm_out = sample_pblstm(example_batch[0])
+print(ex_pblstm_out[0].shape)
+
+"""##### Stacked pBLSTM Encoder"""
+
+class pBLSTMEncoder(tf.keras.Model):
+  def __init__(self, hidden_dim=256, key_size=128, value_size=128):
+    super(pBLSTMEncoder, self).__init__()
+    self.enc_units = hidden_dim
+    # self.value_size = value_size
+    # self.key_size = key_size
+    
+    # Structure proposed in LAS
+    ##________ first Bi-LSTM layer in Encoder ------- ##
+    ## bottom BLSTM layer
+    self.lstm_1 = L.LSTM(self.enc_units, return_sequences=True, return_state=True, name='Encoder_bilstm') 
+    self.blstm_1 = L.Bidirectional(self.lstm_1) # (B, T, hidden * 2)
+
+    ## 3 Layers of piramid-BLSTM
+    ### to reduce time resolution 2^3 = 8 times; This is critical to allow
+    ### the Attention model to extract the relevant info from a smalle number of time-steps
+    ### The deep-arch also allows the model to learn nonliner feature representation of the data
+    self.pblstm_1 = pBLSTM_block(hidden_dim=self.enc_units) # (B, T/2, hidden * 2)
+    self.pblstm_2 = pBLSTM_block(hidden_dim=self.enc_units)
+    self.pblstm_3 = pBLSTM_block(hidden_dim=self.enc_units) # (B, T/8, hidden * 2)
+
+    # ## Key && Value Projections
+    # self.key_proj = L.Dense(self.key_size, name='enc_key_proj') # (B, T, V/K)
+    # self.value_proj = L.Dense(self.value_size, name='enc_value_proj') # (B, T, V/K)
+
+    # self.relu = L.LeakyReLU(alpha=1e-2)
+
+
+  def call(self, x_padded):
+    '''
+    param x_padded: padded input, (B, T_max, F)
+    param x_lens: actual senquence length (B, ) __TODO
+    '''
+
+    # (B, T, hidden*2)
+    # x_initial, _, _ = self.lstm_1(x_padded)
+    x_initial, _, _, _, _ = self.blstm_1(x_padded) 
+
+    # if debug_mode:
+    #   print("Transformed LSTM output: ", x_initial.shape)
+
+    x, _, _, _, _ = self.pblstm_1(x_initial)
+    x, _, _, _, _ = self.pblstm_2(x)
+
+    # (B, T/8, hidden*2)
+    x, _, _, _, _ = self.pblstm_3(x)
+
+    # key = self.key_proj(x) # (B, T, K)
+    # value = self.value_proj(x) # (B, T, V)
+
+    # key_act = self.relu(key)
+    # value_act = self.relu(value)
+
+    return x
+
+sample_pblstm_encoder = pBLSTMEncoder(hidden_dim=256)
+
+ex_pblstm_enc_output = sample_pblstm_encoder(example_batch[0])
+
+print(ex_pblstm_enc_output.shape) # (B, T*/8, 2H)
+
 """#### Encoder Module
 The `Encoder` consists of:
 1.   Input Embedding
@@ -1446,8 +1564,12 @@ class Encoder(tf.keras.layers.Layer):
 
     # 'Embedding': (B, T, d_model)
     # self.embedding = tf.keras.layers.Embedding(input_vocab_size, d_model) # the original embedding layer in text-to-text transformer
-    ## Utterence compression, concatanate along sequence dims T//2
+    ## Option 1. Utterence compression, concatanate along sequence dims T//2
     self.utter_compress = UtterCompress(num_layers=3) # (B, T*/8, F*8)
+
+    ## Option 2. pBLSTM based encoding
+    self.pblstm_encoding = pBLSTMEncoder(d_model//2) # (B, T*/8, d_model)
+
     self.embedding = L.Dense(self.d_model)
 
     # Pos_encoding: (1, n (n>>input_seq_len), d_model)
@@ -1467,29 +1589,36 @@ class Encoder(tf.keras.layers.Layer):
     '''
     # print("input Utter: ", x.shape)
 
-    # utter compress
-    x = self.utter_compress(x)
+    # # 1. utter compress
+    # x = self.utter_compress(x)
 
-    # print("Compressed Utter: ", x.shape)
+    # # print("Compressed Utter: ", x.shape)
 
-    seq_len = tf.shape(x)[1]
-    # adding embedding and position encoding.
-    x = self.embedding(x)  # (batch_size, input_seq_len, d_model)
-    x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-    x += self.pos_encoding[:, :seq_len, :] # broadcast and slice to (B, input_seq_len/T, d_model)
+    # seq_len = tf.shape(x)[1]
+    # # adding embedding and position encoding.
+    # x = self.embedding(x)  # (batch_size, input_seq_len, d_model)
+    # x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
+    # x += self.pos_encoding[:, :seq_len, :] # broadcast and slice to (B, input_seq_len/T, d_model)
+
+    # 2. stacked pBLSTMs encoding
+    ## Alreay position aware, no need to add position encoding
+    ## Retrace debug
+    # print("Applying Stacked pBLSTMs to encode input Utterence")
+    x = self.pblstm_encoding(x) # (B, T*/8, d_model)
 
     x = self.dropout(x, training=training)
 
     for i in range(self.num_layers):
       x = self.enc_layers[i](x, training, mask)
 
-    return x  # (batch_size, input_seq_len, d_model)
+    return x  # (batch_size, input_seq_len*, d_model)
 
 ## Dev
 sample_encoder = Encoder(num_layers=2, d_model=512, num_heads=8,
                          dff=2048, input_vocab_size=8500,
                          maximum_position_encoding=10000)
-temp_input = tf.random.uniform((64, 62, 40), dtype=tf.int64, minval=0, maxval=200) # (B=64, T=62, F=40)
+# temp_input = tf.random.uniform((64, 62, 40), dtype=tf.int64, minval=0, maxval=200) # (B=64, T=62, F=40)
+temp_input = tf.random.uniform((64, 62, 40), dtype=tf.float32)
 
 sample_encoder_output = sample_encoder(temp_input, training=False, mask=None)
 
@@ -1503,7 +1632,7 @@ print(np.sum(example_batch[0][0].numpy() == 0), 40*(example_batch[0].shape[1] - 
 example_encoder_output = sample_encoder(example_batch[0], training=False, mask=None)
 print(example_encoder_output.shape) # (B, T_max, d_model)
 
-print(example_batch[0][:, :, 0])
+print(example_batch[0][:, :, 0]) #(B, T_max)
 # validate padding length
 print(np.sum(example_batch[0][:, :, 0][0].numpy() == 0), example_batch[0].shape[1] - example_batch[2][0])
 ## generate mask for encoder input (B, T_max, F) 
@@ -1513,7 +1642,8 @@ print(np.sum(example_batch[0][:, :, 0][0].numpy() == 0), example_batch[0].shape[
 # Need to input actual compressed input/utter_lens
 example_enc_padding_mask, example_combined_mask, example_dec_padding_mask = create_masks_utter(example_batch[0], example_batch[1], example_batch[2])
 
-print(example_enc_padding_mask)
+print(example_enc_padding_mask.shape, example_dec_padding_mask.shape)
+# print(tf.squeeze(example_enc_padding_mask).numpy)
 # validate if the masked postion equals actual padding length derived from seq_lens
 print(np.sum(example_enc_padding_mask.numpy()), tf.reduce_sum(example_batch[0].shape[1] - example_batch[2]))
 print(np.sum(example_dec_padding_mask.numpy()), tf.reduce_sum(example_batch[0].shape[1] - example_batch[2]))
@@ -1522,28 +1652,32 @@ example_encoder_output_with_mask = sample_encoder(example_batch[0], training=Fal
 
 print(example_encoder_output_with_mask.shape) # (B, T*//8, d_model)
 
+print(example_combined_mask.shape)
+print(example_combined_mask[0])
+
+tf.squeeze(example_enc_padding_mask)[0], tf.squeeze(example_enc_padding_mask)[1], example_batch[2][0]//8, example_batch[2][1]//8
+
 ## DEV Reshape
-print(example_batch[0][0]) # (T_max, F=40)
-
+# print(example_batch[0][0]) # (T_max, F=40)
 ## DEV
-t = tf.random.uniform((4, 9, 40), dtype=tf.float32)
-print(t)
+# t = tf.random.uniform((4, 9, 40), dtype=tf.float32)
+# print(t)
 
-t_a = t[:, :(tf.shape(t)[1] // 2) * 2, :]
-# print(t_a)
-t_c = tf.reshape(t_a, [4, -1, t_a.shape[2]*2])
-print(t_c)
+# t_a = t[:, :(tf.shape(t)[1] // 2) * 2, :]
+# # print(t_a)
+# t_c = tf.reshape(t_a, [4, -1, t_a.shape[2]*2])
+# print(t_c)
 
-print(t[0, 0:2, :])
-print(t_c[0, 0:1, :])
+# print(t[0, 0:2, :])
+# print(t_c[0, 0:1, :])
 
-print(example_batch[0])
-ex_utter = example_batch[0]
+# print(example_batch[0])
+# ex_utter = example_batch[0]
 
-t_a = ex_utter[:, :(tf.shape(ex_utter)[1] // 2) * 2, :]
-# print(t_a)
-t_c = tf.reshape(t_a, [t_a.shape[0], -1, t_a.shape[2]*2])
-print(t_c)
+# t_a = ex_utter[:, :(tf.shape(ex_utter)[1] // 2) * 2, :]
+# # print(t_a)
+# t_c = tf.reshape(t_a, [t_a.shape[0], -1, t_a.shape[2]*2])
+# print(t_c)
 
 """### Decoder
 
@@ -1699,8 +1833,11 @@ class Transformer(tf.keras.Model):
   def __init__(self, num_layers, d_model, num_heads, dff, input_vocab_size,
                target_vocab_size, pe_input, pe_target, rate=0.1):
     super(Transformer, self).__init__()
+    ## EXPLORATION
+    # self.encoder_layers = num_layers # Base structure
+    self.encoder_layers = 1 # single MHA encoder
 
-    self.encoder = Encoder(num_layers, d_model, num_heads, dff,
+    self.encoder = Encoder(self.encoder_layers, d_model, num_heads, dff,
                              input_vocab_size, pe_input, rate)
 
     self.decoder = Decoder(num_layers, d_model, num_heads, dff,
@@ -1728,7 +1865,8 @@ sample_transformer = Transformer(
     input_vocab_size=8500, target_vocab_size=8000,
     pe_input=10000, pe_target=6000) #PE maximum position encoding length (<=1e4)
 
-temp_input = tf.random.uniform((64, 38, 40), dtype=tf.int64, minval=0, maxval=200)
+# temp_input = tf.random.uniform((64, 38, 40), dtype=tf.int64, minval=0, maxval=200)
+temp_input = tf.random.uniform((64, 38, 40), dtype=tf.float32)
 temp_target = tf.random.uniform((64, 36), dtype=tf.int64, minval=0, maxval=200)
 
 fn_out, _ = sample_transformer(temp_input, temp_target, training=False,
@@ -1761,9 +1899,9 @@ print(example_transformer_out_with_mask[0])
 * hyper params...
 """
 
-num_layers = 4
-d_model = 128
-dff = 512
+num_layers = 2 #4
+d_model = 512 #128
+dff = 2048  # 2048
 num_heads = 8
 dropout_rate = 0.1
 
@@ -1772,6 +1910,9 @@ print("Output Vocabulary Size: {}".format(target_vocab_size))
 # Adam
 # beta1=0.9, beta2=0.98, eps=1e-9
 LR_WARMUP = 400
+
+
+CP_STORAGE_INTERVAL = 10
 
 transformer = Transformer(
     num_layers=num_layers,
@@ -1812,9 +1953,9 @@ class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
 
 learning_rate = CustomSchedule(d_model, warmup_steps=LR_WARMUP)
 
-# optimizer = tf.keras.optimizers.Adam(learning_rate, beta_1=0.9, beta_2=0.98,
-#                                      epsilon=1e-9)
-optimizer = tf.keras.optimizers.Adam()
+optimizer = tf.keras.optimizers.Adam(learning_rate, beta_1=0.9, beta_2=0.98,
+                                     epsilon=1e-9)
+# optimizer = tf.keras.optimizers.Adam()
 
 ## Dev
 temp_learning_rate_schedule = CustomSchedule(d_model, warmup_steps=400)
@@ -1868,7 +2009,8 @@ train_accuracy = tf.keras.metrics.Mean(name='train_accuracy')
 
 """#### Training CheckPoints (CP)"""
 
-checkpoint_path = './colab_storage/LAS/Transformer/train/weights/'
+VERSION = 'single_pBLSTM_encoding_ENC_MHA' #"single_layer_MHA_pBLSTM_utter_encoding"
+checkpoint_path = './colab_storage/LAS/Transformer/{}/train/weights/'.format(VERSION)
 
 ckpt = tf.train.Checkpoint(transformer=transformer,
                            optimizer=optimizer)
@@ -1911,7 +2053,7 @@ def plot_attention_weights(attention_heads, sentence=None, translated_tokens=Non
   # in_tokens = tokenizers.pt.lookup(in_tokens)[0]
   # in_tokens
 
-  fig = plt.figure(figsize=(16, 8))
+  fig = plt.figure(figsize=(12, 6))
 
   for h, head in enumerate(attention_heads):
     ax = fig.add_subplot(2, 4, h+1)
@@ -1922,6 +2064,56 @@ def plot_attention_weights(attention_heads, sentence=None, translated_tokens=Non
 
   plt.tight_layout()
   plt.show()
+
+def plot_grad_flow_(grads_and_vars):
+  '''
+  input (gradients, trainable_variables)
+  '''
+  grads = grads_and_vars[0]
+  vars = grads_and_vars[1]
+
+  ave_grads = []    
+  max_grads= []    
+  layers = [] 
+
+  print("# variables {}, # grads {}".format(len(vars), len(grads)))
+
+  for grad, var in zip(grads, vars):
+    name = var.name
+    if "encoder" in var.name and "normalization" not in var.name:
+      # print(var.name)
+      layers.append(name)
+
+      # reduce over all dims/elements                
+      ave_grads.append(tf.reduce_mean(tf.abs(grad)))     
+      max_grads.append(tf.reduce_max(tf.abs(grad)))
+
+  plt.clf()
+  plt.figure(figsize=(24, 12))
+  plt.bar(np.arange(len(max_grads)), max_grads, alpha=0.1, lw=1, color="r")    
+  plt.bar(np.arange(len(max_grads)), ave_grads, alpha=0.1, lw=1, color="b")    
+  plt.hlines(0, 0, len(ave_grads)+1, lw=2, color="k" )    
+  plt.xticks(range(0,len(ave_grads), 1), layers, rotation="vertical")   
+  # plt.xticks(range(0,len(ave_grads), 1),  rotation="vertical") 
+  plt.xlim(left=0, right=len(ave_grads))    
+  # plt.ylim(bottom = -0.001, top=0.02) # zoom in on the lower gradient regions    
+  plt.xlabel("Layers")
+  plt.ylabel("average gradient")    
+  plt.title("Gradient flow")    
+  #plt.tight_layout()    
+  plt.grid(True)    
+  # plt.legend([Line2D([0], [0], color="c", lw=4),
+  #             Line2D([0], [0], color="b", lw=4),
+  #             Line2D([0], [0], color="k", lw=4)], ['max-gradient', 'mean-gradient', 'zero-gradient'])    
+  return plt
+
+# vars = transformer.trainable_variables
+
+# for var in vars:
+#   if "encoder" in var.name and "normalization" not in var.name:
+#     print(var.name)
+
+
 
 """#### E2E test"""
 
@@ -1936,14 +2128,19 @@ print(len(ex_transformer_dec_attentions)) # (N=4, 2 sublayer attention per block
 
 ## Plot attention
 # shape: (batch=, num_heads, seq_len_q, seq_len_k)
-ex_attention_heads = ex_transformer_dec_attentions['decoder_layer{}_block2'.format(num_layers)] # Last encoder block
+ex_attention_heads_b2 = ex_transformer_dec_attentions['decoder_layer{}_block2'.format(num_layers)] # Last encoder block
+
+ex_attention_heads_b1 = ex_transformer_dec_attentions['decoder_layer{}_block1'.format(num_layers)] # Self attention block
+
 
 # 
-print(ex_attention_heads.shape)
+print(ex_attention_heads_b2.shape)
 
-plot_attention_head(ex_attention_heads[0][0])
+plot_attention_head(ex_attention_heads_b2[0][0])
 
-plot_attention_weights(ex_attention_heads[0]) # the frist sample in the batch
+plot_attention_weights(ex_attention_heads_b2[0]) # the frist sample in the batch
+
+plot_attention_weights(ex_attention_heads_b1[0]) # the frist sample in the batch
 
 """### Training Execution
 
@@ -1972,14 +2169,18 @@ def train_step(inp, tar, inp_lens):
   # But still keep the '<eos>' token in target, - we still need to learn when to end the sequence 
   dec_input = tf.pad(tar[:, :-1], [[0, 0], [1, 0]], "CONSTANT", constant_values=letter2index['<sos>'])
 
+  # # No Masking
+  # enc_padding_mask, combined_mask, dec_padding_mask = None, None, None
+
   enc_padding_mask, combined_mask, dec_padding_mask = create_masks_utter(inp, dec_input, inp_lens)
   # will be traced for the first time, tf.print() to log for each step
-  print("Encoder padding mask shape (B, 1, 1, input_seq_len/T): {}".format(enc_padding_mask.shape))
-  print("Decoder-Encoder attention padding mask shape (B, 1, 1, T): {}".format(dec_padding_mask.shape))
-  print("Decoder self-attention mask shape (B, 1, L, L): {}".format(combined_mask.shape))
+  # if debug_mode:
+  print("Encoder padding mask shape (B, 1, 1, input_seq_len/T): {}, sum: {}".format(enc_padding_mask.shape, tf.reduce_sum(tf.cast(enc_padding_mask == 0, tf.int32))))
+  print("Decoder-Encoder attention padding mask shape (B, 1, 1, T): {}, sum: {}".format(dec_padding_mask.shape, tf.reduce_sum(tf.cast(dec_padding_mask == 0, tf.int32))))
+  print("Decoder self-attention mask shape (B, 1, L, L): {}, sum: {}".format(combined_mask.shape, tf.reduce_sum(tf.cast(combined_mask == 0, tf.int32))))
 
   with tf.GradientTape() as tape:
-    predictions, _ = transformer(inp, dec_input,
+    predictions, attentions = transformer(inp, dec_input,
                                  True,
                                  enc_padding_mask,
                                  combined_mask,
@@ -1994,7 +2195,9 @@ def train_step(inp, tar, inp_lens):
   train_loss_per_word(loss_per_word)
   # train_accuracy(accuracy_function(tainr, predictions)) #int64 and int32 conflict...
 
-def val(input, target, input_lens, model):
+  return (gradients, transformer.trainable_variables), attentions
+
+def val(input, target, input_lens, model, debug_mode=False):
   '''
   :param@input - (B, T_max, F=40)
   '''
@@ -2003,11 +2206,15 @@ def val(input, target, input_lens, model):
 
   dec_input = tf.pad(target[:, :-1], [[0, 0], [1, 0]], "CONSTANT", constant_values=letter2index['<sos>'])
 
+  # # No Masking
+  # enc_padding_mask, combined_mask, dec_padding_mask = None, None, None
+
   enc_padding_mask, combined_mask, dec_padding_mask = create_masks_utter(input, dec_input, input_lens)
   # will be traced for the first time, tf.print() to log for each step
-  print("Encoder padding mask shape (B, 1, 1, input_seq_len/T): {}".format(enc_padding_mask.shape))
-  print("Decoder-Encoder attention padding mask shape (B, 1, 1, T): {}".format(dec_padding_mask.shape))
-  print("Decoder self-attention mask shape (B, 1, L, L): {}".format(combined_mask.shape))
+  if debug_mode:
+    print("Encoder padding mask shape (B, 1, 1, input_seq_len/T): {}".format(enc_padding_mask.shape))
+    print("Decoder-Encoder attention padding mask shape (B, 1, 1, T): {}".format(dec_padding_mask.shape))
+    print("Decoder self-attention mask shape (B, 1, L, L): {}".format(combined_mask.shape))
 
   predictions, att_weights = model(input, dec_input,
                                  False,
@@ -2026,7 +2233,7 @@ def val(input, target, input_lens, model):
 
   # spell = transform_index_to_letter([best_path_raw_idx], [letter2index['<eos>'], letter2index['<pad>']], igonre_idxs=[letter2index['<sos>']])
 
-  print("Target Text: {} \n Predicted Text: {}".format(target_text[0], pred_text[0]))
+  print("Target Text: {} \nPredicted Text: {}".format(target_text[0], pred_text[0]))
   
   for pred, target in zip(pred_text, target_text):
     dist = LEV.distance(pred, target)
@@ -2037,12 +2244,17 @@ def val(input, target, input_lens, model):
 
   ## Plot Attention Weights
   # shape: (batch=, num_heads, seq_len_q, seq_len_k)
-  attention_heads = att_weights['decoder_layer{}_block2'.format(num_layers)] # Last Encoder Layer, dec-enc attention
+  attention_heads_b2 = att_weights['decoder_layer{}_block2'.format(num_layers)] # Last Encoder Layer, dec-enc attention
+  attention_heads_b1 = att_weights['decoder_layer{}_block1'.format(num_layers)] # Last Encoder Layer, Self-Attention
 
+  ## Raw att weights
+  # print(attention_heads[0][0])
   ## pick the first sample
-  plot_attention_weights(attention_heads[0])
+  plot_attention_weights(attention_heads_b2[0])
+  plot_attention_weights(attention_heads_b1[0])
 
-EPOCHS = 10
+EPOCHS = 20
+debug_mode=True
 
 data =  result_train # dev dataset: result
 
@@ -2061,7 +2273,7 @@ for epoch in range(EPOCHS):
     # print("Input Utter Shape: ", inp.shape)
     # print("Target Trans Shape: ", targ.shape)
 
-    train_step(inp, targ, input_lens)
+    grads_and_vars, train_atts = train_step(inp, targ, input_lens)
 
     batch_perplex = tf.math.exp(train_loss_per_word.result()) # PPL
     if batch % 10 == 0:
@@ -2074,17 +2286,34 @@ for epoch in range(EPOCHS):
                                                    period_runtime))
 
     if batch % 50 == 0:
+      # 
+      print("Training Attentions MAT: ")
+      # print(train_atts['decoder_layer{}_block2'.format(1)][0][0])
+      plot_attention_weights(train_atts['decoder_layer{}_block2'.format(num_layers)][0])
+
+      plot_attention_weights(train_atts['decoder_layer{}_block1'.format(num_layers)][0])
+      # ## Gradients Flow
+      # plot_grad_flow_(grads_and_vars)
       # print(f'Epoch {epoch + 1} Batch {batch} Loss {train_loss.result():.4f}, [DEBUG]unmasked Loss {train_og_loss.result():.4f}; Loss_per_word: {train_loss_per_word.result():.4f}') # ; Accuracy {train_accuracy.result():.4f}')
       # Validation Rountine
-      val(inp, targ, input_lens, transformer)
+      val(inp, targ, input_lens, transformer, debug_mode=debug_mode)
 
-  if (epoch + 1) % 5 == 0:
+  if (epoch + 1) % CP_STORAGE_INTERVAL == 0:
     ckpt_save_path = ckpt_manager.save()
     print(f'Saving checkpoint for epoch {epoch+1} at {ckpt_save_path}')
 
   print(f'Epoch {epoch + 1} Loss {train_loss.result():.4f} Accuracy {train_accuracy.result():.4f}')
 
   print(f'Time taken for 1 epoch: {time.time() - start:.2f} secs\n')
+
+ckpt_manager.save()
+
+## VAL ROUNTINE DEBUG
+for (batch, (inp, targ, input_lens, target_lens)) in enumerate(data):
+    print("Input Utter Shape: ", inp.shape)
+    print("Target Trans Shape: ", targ.shape)
+
+    val(inp, targ, input_lens, transformer)
 
 transformer.summary()
 
